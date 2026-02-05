@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Chunker — Customer Boundary Detection</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+    :root {
+      --bg: #f5f1ea;
+      --surface: #fdfaf4;
+      --text: #3d3830;
+      --text-2: #6a6259;
+      --text-3: #a09686;
+      --border: #e5ddd0;
+      --accent: #5a7a8a;
+      --accent-soft: #eef2f4;
+      --pass: #5a8a6a;
+      --pass-soft: #f0f5ef;
+      --fail: #c4785c;
+      --fail-soft: #faf2ed;
+      --gap: #9a9488;
+      --gap-soft: #f4f2ed;
+      --warning: #b8943d;
+      --warning-soft: #fdf8ec;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+      line-height: 1.5;
+      font-size: 14px;
+    }
+
+    .header {
+      max-width: 1100px;
+      margin: 0 auto 24px;
+    }
+
+    .header h1 {
+      font-size: 22px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .header p { font-size: 13px; color: var(--text-2); }
+
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+
+    .container.full-width {
+      grid-template-columns: 1fr;
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-2);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .panel-body { padding: 16px; }
+
+    /* Upload zone */
+    .upload-zone {
+      border: 1.5px dashed var(--border);
+      border-radius: 10px;
+      padding: 40px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+
+    .upload-zone:hover { border-color: var(--accent); background: var(--accent-soft); }
+    .upload-zone.active { border-color: var(--accent); background: var(--accent-soft); }
+    .upload-zone p { font-size: 15px; color: var(--text); margin-bottom: 4px; }
+    .upload-zone small { font-size: 12px; color: var(--text-3); }
+    .upload-zone input { display: none; }
+
+    /* Config */
+    .config-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 14px;
+      padding: 10px 14px;
+      background: var(--bg);
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+
+    .config-row label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-2);
+      white-space: nowrap;
+    }
+
+    .config-row input[type="number"] {
+      width: 60px;
+      padding: 5px 8px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      font-family: inherit;
+      font-size: 13px;
+      text-align: center;
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    .config-row input:focus { outline: none; border-color: var(--accent); }
+
+    .config-row small { font-size: 11px; color: var(--text-3); }
+
+    /* Processing */
+    .processing {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px;
+      background: var(--accent-soft);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }
+
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+
+    .processing span { font-size: 13px; color: var(--text-2); }
+
+    /* Summary stats */
+    .stats-bar {
+      display: flex;
+      gap: 16px;
+      padding: 10px 14px;
+      background: var(--bg);
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+
+    .stat {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+    }
+
+    .stat strong { font-weight: 600; }
+    .stat.pages { color: var(--accent); }
+    .stat.customers { color: var(--pass); }
+    .stat.batches { color: var(--warning); }
+    .stat.weak { color: var(--fail); }
+
+    /* Customer list */
+    .customer-list { max-height: 70vh; overflow-y: auto; }
+
+    .batch-header {
+      padding: 6px 12px;
+      background: var(--text);
+      color: var(--bg);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .customer-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      transition: background 0.15s;
+    }
+
+    .customer-item:hover { background: var(--bg); }
+
+    .customer-num {
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 600;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .customer-num.strong { background: var(--pass-soft); color: var(--pass); }
+    .customer-num.medium { background: var(--warning-soft); color: var(--warning); }
+    .customer-num.weak { background: var(--fail-soft); color: var(--fail); }
+
+    .customer-info { flex: 1; min-width: 0; }
+
+    .customer-name {
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .customer-address {
+      font-size: 12px;
+      color: var(--text-2);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .customer-meta {
+      font-size: 11px;
+      color: var(--text-3);
+      font-family: 'IBM Plex Mono', monospace;
+      margin-top: 2px;
+    }
+
+    .customer-meta .confidence {
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+
+    .confidence.strong { background: var(--pass-soft); color: var(--pass); }
+    .confidence.medium { background: var(--warning-soft); color: var(--warning); }
+    .confidence.weak { background: var(--fail-soft); color: var(--fail); }
+
+    .page-badge {
+      font-size: 11px;
+      font-family: 'IBM Plex Mono', monospace;
+      color: var(--text-3);
+      white-space: nowrap;
+      padding-top: 4px;
+    }
+
+    /* Page text viewer */
+    .page-viewer { max-height: 70vh; overflow-y: auto; }
+
+    .page-block {
+      margin-bottom: 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .page-block-header {
+      padding: 6px 12px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-2);
+      display: flex;
+      justify-content: space-between;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .page-block-header:hover { background: var(--border); }
+
+    .page-block-body {
+      padding: 10px 12px;
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 11px;
+      white-space: pre-wrap;
+      color: var(--text-2);
+      max-height: 200px;
+      overflow-y: auto;
+      line-height: 1.6;
+    }
+
+    .page-block-body.collapsed { display: none; }
+
+    .highlight-address {
+      background: var(--pass-soft);
+      border-left: 2px solid var(--pass);
+      padding: 0 4px;
+      display: inline;
+    }
+
+    .highlight-boundary {
+      background: var(--warning-soft);
+      border-left: 2px solid var(--warning);
+      padding: 0 4px;
+      display: inline;
+    }
+
+    /* Tabs */
+    .tab-bar {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .tab-btn {
+      flex: 1;
+      padding: 10px;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      border: none;
+      background: none;
+      color: var(--text-3);
+      cursor: pointer;
+      position: relative;
+      transition: all 0.2s;
+    }
+
+    .tab-btn.active { color: var(--accent); font-weight: 600; }
+
+    .tab-btn.active::after {
+      content: '';
+      position: absolute;
+      bottom: 0;
+      left: 16px; right: 16px;
+      height: 2px;
+      background: var(--accent);
+      border-radius: 2px 2px 0 0;
+    }
+
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* Debug section */
+    .debug-toggle {
+      font-size: 11px;
+      color: var(--text-3);
+      cursor: pointer;
+      background: none;
+      border: none;
+      font-family: inherit;
+      text-decoration: underline;
+      padding: 0;
+    }
+
+    .pattern-config {
+      margin-top: 10px;
+      padding: 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .pattern-config label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-2);
+      margin-bottom: 4px;
+    }
+
+    .pattern-config textarea {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 11px;
+      background: var(--surface);
+      color: var(--text);
+      resize: vertical;
+      min-height: 60px;
+    }
+
+    .pattern-config textarea:focus { outline: none; border-color: var(--accent); }
+
+    .pattern-config small { font-size: 10px; color: var(--text-3); display: block; margin-top: 4px; }
+
+    .btn {
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-primary:hover { filter: brightness(1.1); }
+    .btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+    .btn-secondary:hover { border-color: var(--text-3); }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1>PDF Chunker — Boundary Detection POC</h1>
+    <p>Upload a multi-customer After Sample PDF. Detects customer boundaries via address blocks (Name → Street → City, ST ZIP).</p>
+  </div>
+
+  <div class="container full-width" id="uploadContainer">
+    <div class="panel">
+      <div class="panel-header">
+        <span>Upload</span>
+      </div>
+      <div class="panel-body">
+        <div class="upload-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+          <input type="file" id="fileInput" accept=".pdf" onchange="handleFile(event)">
+          <p>Drop mega-PDF here or click to select</p>
+          <small>Multi-customer After Sample document</small>
+        </div>
+
+        <div class="config-row">
+          <label>Batch size:</label>
+          <input type="number" id="batchSize" value="12" min="1" max="50">
+          <small>Customers per orchestrator batch (10-15 recommended)</small>
+        </div>
+
+        <div class="pattern-config hidden" id="patternConfig">
+          <label>Address detection — vertical zone (% from top of page)</label>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+            <input type="number" id="zoneTop" value="5" min="0" max="100" style="width:55px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-family:inherit;font-size:12px;background:var(--surface);color:var(--text);text-align:center;">
+            <span style="font-size:12px;color:var(--text-3);">% to</span>
+            <input type="number" id="zoneBottom" value="55" min="0" max="100" style="width:55px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-family:inherit;font-size:12px;background:var(--surface);color:var(--text);text-align:center;">
+            <span style="font-size:12px;color:var(--text-3);">% of page height</span>
+          </div>
+          <label>Additional boundary keywords (one per line, optional)</label>
+          <textarea id="extraKeywords" placeholder="e.g.&#10;RE: Loan Number&#10;Dear Borrower"></textarea>
+          <small>Lines containing these terms boost boundary confidence</small>
+        </div>
+
+        <div style="margin-top:10px;text-align:right;">
+          <button class="debug-toggle" onclick="document.getElementById('patternConfig').classList.toggle('hidden')">⚙ Detection settings</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Processing state -->
+  <div class="container full-width hidden" id="processingContainer">
+    <div class="panel">
+      <div class="panel-body">
+        <div class="processing">
+          <div class="spinner"></div>
+          <span id="processingText">Extracting text from PDF...</span>
+        </div>
+        <div style="background:var(--bg);border-radius:8px;overflow:hidden;height:6px;border:1px solid var(--border);">
+          <div id="progressBar" style="height:100%;background:var(--accent);width:0%;transition:width 0.3s ease;border-radius:6px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div class="container hidden" id="resultsContainer">
+    <!-- Left: detected customers -->
+    <div class="panel">
+      <div class="panel-header">
+        <span>Detected Customers</span>
+        <span id="customerCount" style="font-weight:400;">0</span>
+      </div>
+      <div class="stats-bar" id="statsBar"></div>
+      <div class="customer-list" id="customerList"></div>
+    </div>
+
+    <!-- Right: page text -->
+    <div class="panel">
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchResultTab('pages', this)">Page Text</button>
+        <button class="tab-btn" onclick="switchResultTab('manifest', this)">Manifest JSON</button>
+      </div>
+      <div class="tab-content active" id="tab-pages">
+        <div class="page-viewer" id="pageViewer"></div>
+      </div>
+      <div class="tab-content" id="tab-manifest">
+        <div style="padding:12px;">
+          <pre id="manifestJson" style="font-family:'IBM Plex Mono',monospace;font-size:11px;white-space:pre-wrap;max-height:70vh;overflow-y:auto;background:var(--bg);padding:12px;border-radius:8px;border:1px solid var(--border);color:var(--text-2);"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    // ===== STATE =====
+    let pageTexts = [];        // [{pageNum, text, items}]  items = positioned text items
+    let detectedCustomers = []; // [{name, street, cityStateZip, state, zip, pageStart, pageEnd, confidence, addressLines}]
+
+    // ===== US STATES =====
+    const US_STATES = new Set([
+      'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA',
+      'KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ',
+      'NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT',
+      'VA','WA','WV','WI','WY','DC','PR','VI','GU','AS','MP'
+    ]);
+
+    // ===== DRAG AND DROP =====
+    const dropZone = document.getElementById('dropZone');
+    document.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('active'); });
+    document.addEventListener('dragleave', e => { if (!e.relatedTarget || !dropZone.contains(e.relatedTarget)) dropZone.classList.remove('active'); });
+    document.addEventListener('drop', e => {
+      e.preventDefault();
+      dropZone.classList.remove('active');
+      if (e.dataTransfer.files.length && e.dataTransfer.files[0].type === 'application/pdf') {
+        processFile(e.dataTransfer.files[0]);
+      }
+    });
+
+    function handleFile(event) {
+      const file = event.target.files[0];
+      if (file) processFile(file);
+    }
+
+    // ===== MAIN PROCESSING =====
+    async function processFile(file) {
+      document.getElementById('uploadContainer').classList.add('hidden');
+      document.getElementById('processingContainer').classList.remove('hidden');
+
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const totalPages = pdf.numPages;
+
+      pageTexts = [];
+
+      // Extract text from every page with position data
+      for (let i = 1; i <= totalPages; i++) {
+        document.getElementById('processingText').textContent = `Extracting text — page ${i} of ${totalPages}`;
+        document.getElementById('progressBar').style.width = (i / totalPages * 70) + '%';
+
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale: 1.0 });
+        const textContent = await page.getTextContent();
+
+        // Build lines from text items using Y-position clustering
+        const items = textContent.items.map(item => ({
+          text: item.str,
+          x: item.transform[4],
+          y: item.transform[5],
+          height: item.height || 10,
+          width: item.width || 0,
+        }));
+
+        // Cluster into lines by Y position (within 3px = same line)
+        const lines = clusterIntoLines(items, viewport.height);
+
+        pageTexts.push({
+          pageNum: i,
+          lines: lines,
+          fullText: lines.map(l => l.text).join('\n'),
+          viewportHeight: viewport.height,
+        });
+      }
+
+      // Detect customer boundaries
+      document.getElementById('processingText').textContent = 'Detecting customer boundaries...';
+      document.getElementById('progressBar').style.width = '80%';
+
+      detectCustomerBoundaries();
+
+      // Assign page ranges
+      assignPageRanges();
+
+      document.getElementById('progressBar').style.width = '100%';
+      document.getElementById('processingText').textContent = 'Done.';
+
+      setTimeout(() => {
+        document.getElementById('processingContainer').classList.add('hidden');
+        document.getElementById('resultsContainer').classList.remove('hidden');
+        renderResults();
+      }, 300);
+    }
+
+    // ===== TEXT LINE CLUSTERING =====
+    function clusterIntoLines(items, pageHeight) {
+      if (!items.length) return [];
+
+      // Sort by Y descending (PDF coordinates: 0 is bottom), then X ascending
+      const sorted = [...items].sort((a, b) => b.y - a.y || a.x - b.x);
+
+      const lines = [];
+      let currentLine = { items: [sorted[0]], y: sorted[0].y };
+
+      for (let i = 1; i < sorted.length; i++) {
+        const item = sorted[i];
+        if (Math.abs(item.y - currentLine.y) < 3) {
+          currentLine.items.push(item);
+        } else {
+          currentLine.items.sort((a, b) => a.x - b.x);
+          lines.push({
+            text: currentLine.items.map(it => it.text).join(' ').trim(),
+            y: currentLine.y,
+            yPct: ((pageHeight - currentLine.y) / pageHeight) * 100, // % from top
+          });
+          currentLine = { items: [item], y: item.y };
+        }
+      }
+
+      // Don't forget last line
+      currentLine.items.sort((a, b) => a.x - b.x);
+      lines.push({
+        text: currentLine.items.map(it => it.text).join(' ').trim(),
+        y: currentLine.y,
+        yPct: ((pageHeight - currentLine.y) / pageHeight) * 100,
+      });
+
+      return lines.filter(l => l.text.trim());
+    }
+
+    // ===== BOUNDARY DETECTION =====
+    function detectCustomerBoundaries() {
+      detectedCustomers = [];
+
+      const zoneTop = parseFloat(document.getElementById('zoneTop').value) || 5;
+      const zoneBottom = parseFloat(document.getElementById('zoneBottom').value) || 55;
+      const extraKeywords = document.getElementById('extraKeywords').value
+        .split('\n')
+        .map(k => k.trim().toUpperCase())
+        .filter(k => k);
+
+      // City, ST ZIP pattern
+      // Matches: "ANYTOWN, CA 90210" or "ANYTOWN , CA 90210-1234" or "SAN FRANCISCO, NY 10001"
+      const cityStateZipRe = /^(.+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/;
+
+      // Street address pattern — starts with a number
+      const streetRe = /^\d+\s+.{3,}/;
+
+      // Person name heuristic — all caps, 2+ words, no numbers, not a known non-name pattern
+      const nonNamePatterns = [
+        /^P\.?\s*O\.?\s*BOX/i,
+        /^SUITE/i,
+        /^APT/i,
+        /^DEPT/i,
+        /^ATTN/i,
+        /^RE:/i,
+        /^RETURN\s+SERVICE/i,
+        /^FIRST.?CLASS/i,
+        /^PRESORTED/i,
+        /^U\.?S\.?\s*POSTAGE/i,
+      ];
+
+      for (const page of pageTexts) {
+        // Only look in the configured vertical zone
+        const zoneLines = page.lines.filter(l => l.yPct >= zoneTop && l.yPct <= zoneBottom);
+
+        for (let i = 0; i < zoneLines.length; i++) {
+          const line = zoneLines[i].text.trim();
+          const match = line.match(cityStateZipRe);
+
+          if (!match) continue;
+
+          const city = match[1].trim();
+          const state = match[2];
+          const zip = match[3];
+
+          // Validate it's a real US state
+          if (!US_STATES.has(state)) continue;
+
+          // Look backwards for street + name
+          let street = null;
+          let name = null;
+          let confidence = 'weak';
+          let addressLines = [line];
+
+          // Check line above for street address
+          if (i >= 1) {
+            const prevLine = zoneLines[i - 1].text.trim();
+            if (streetRe.test(prevLine)) {
+              street = prevLine;
+              addressLines.unshift(street);
+
+              // Check line above street for name
+              if (i >= 2) {
+                const nameLine = zoneLines[i - 2].text.trim();
+                if (isLikelyPersonName(nameLine, nonNamePatterns)) {
+                  name = nameLine;
+                  addressLines.unshift(name);
+                  confidence = 'strong';
+                }
+              }
+
+              if (!name) confidence = 'medium';
+            } else if (isLikelyPersonName(prevLine, nonNamePatterns)) {
+              // Sometimes there's no street line (PO Box, or name directly above city line)
+              name = prevLine;
+              addressLines.unshift(name);
+              confidence = 'medium';
+            }
+          }
+
+          // Extra keyword boost — check nearby lines for things like "RE: Loan Number"
+          if (extraKeywords.length) {
+            const nearbyText = zoneLines.slice(Math.max(0, i - 5), Math.min(zoneLines.length, i + 10))
+              .map(l => l.text.toUpperCase()).join(' ');
+            const hasKeyword = extraKeywords.some(kw => nearbyText.includes(kw));
+            if (hasKeyword && confidence === 'weak') confidence = 'medium';
+            if (hasKeyword && confidence === 'medium') confidence = 'strong';
+          }
+
+          // Dedup — skip if this looks like the same address block we already found on this page
+          // (some pages might have the address repeated)
+          const isDuplicate = detectedCustomers.some(c =>
+            c.pageStart === page.pageNum &&
+            c.zip === zip &&
+            c.state === state
+          );
+
+          if (isDuplicate) continue;
+
+          // Also skip if this is clearly a return address (very top of page, < 5% zone)
+          // We already filter by zone, but double-check for borderline cases
+
+          detectedCustomers.push({
+            name: name || '(Name not detected)',
+            street: street || '(Street not detected)',
+            cityStateZip: `${city}, ${state} ${zip}`,
+            city,
+            state,
+            zip,
+            pageStart: page.pageNum,
+            pageEnd: null, // assigned later
+            confidence,
+            addressLines,
+            yPct: zoneLines[i].yPct,
+          });
+        }
+      }
+
+      // Sort by page number, then by Y position on page
+      detectedCustomers.sort((a, b) => a.pageStart - b.pageStart || a.yPct - b.yPct);
+
+      // Deduplicate — if same name + state + zip appears multiple times, keep first occurrence
+      const seen = new Set();
+      detectedCustomers = detectedCustomers.filter(c => {
+        const key = `${c.name}|${c.state}|${c.zip}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+
+    function isLikelyPersonName(text, nonNamePatterns) {
+      if (!text || text.length < 3 || text.length > 80) return false;
+
+      // Skip if matches known non-name patterns
+      if (nonNamePatterns.some(re => re.test(text))) return false;
+
+      // Should not contain digits (addresses have digits)
+      if (/\d/.test(text)) return false;
+
+      // Should have at least 2 words
+      const words = text.split(/\s+/).filter(w => w.length > 0);
+      if (words.length < 2) return false;
+
+      // Should be mostly alphabetic + common name characters
+      const cleanText = text.replace(/[,.\-']/g, '');
+      if (!/^[A-Za-z\s]+$/.test(cleanText)) return false;
+
+      return true;
+    }
+
+    // ===== PAGE RANGE ASSIGNMENT =====
+    function assignPageRanges() {
+      for (let i = 0; i < detectedCustomers.length; i++) {
+        if (i < detectedCustomers.length - 1) {
+          detectedCustomers[i].pageEnd = detectedCustomers[i + 1].pageStart - 1;
+        } else {
+          detectedCustomers[i].pageEnd = pageTexts.length;
+        }
+        // Ensure pageEnd >= pageStart
+        if (detectedCustomers[i].pageEnd < detectedCustomers[i].pageStart) {
+          detectedCustomers[i].pageEnd = detectedCustomers[i].pageStart;
+        }
+      }
+    }
+
+    // ===== RENDER =====
+    function renderResults() {
+      const batchSize = parseInt(document.getElementById('batchSize').value) || 12;
+      const totalBatches = Math.ceil(detectedCustomers.length / batchSize);
+
+      // Stats
+      const strongCount = detectedCustomers.filter(c => c.confidence === 'strong').length;
+      const mediumCount = detectedCustomers.filter(c => c.confidence === 'medium').length;
+      const weakCount = detectedCustomers.filter(c => c.confidence === 'weak').length;
+
+      document.getElementById('customerCount').textContent = detectedCustomers.length;
+      document.getElementById('statsBar').innerHTML =
+        `<div class="stat pages"><strong>${pageTexts.length}</strong> pages</div>` +
+        `<div class="stat customers"><strong>${detectedCustomers.length}</strong> customers</div>` +
+        `<div class="stat batches"><strong>${totalBatches}</strong> batches of ${batchSize}</div>` +
+        (strongCount ? `<div class="stat" style="color:var(--pass)"><strong>${strongCount}</strong> strong</div>` : '') +
+        (mediumCount ? `<div class="stat" style="color:var(--warning)"><strong>${mediumCount}</strong> medium</div>` : '') +
+        (weakCount ? `<div class="stat weak"><strong>${weakCount}</strong> weak</div>` : '');
+
+      // Customer list with batch grouping
+      const list = document.getElementById('customerList');
+      list.innerHTML = '';
+
+      let batchNum = 0;
+      for (let i = 0; i < detectedCustomers.length; i++) {
+        if (i % batchSize === 0) {
+          batchNum++;
+          const batchEnd = Math.min(i + batchSize, detectedCustomers.length);
+          const batchEl = document.createElement('div');
+          batchEl.className = 'batch-header';
+          batchEl.innerHTML = `<span>Batch ${batchNum}</span><span>${batchEnd - i} customers</span>`;
+          list.appendChild(batchEl);
+        }
+
+        const c = detectedCustomers[i];
+        const pageRange = c.pageStart === c.pageEnd ? `p.${c.pageStart}` : `p.${c.pageStart}–${c.pageEnd}`;
+        const pageCount = c.pageEnd - c.pageStart + 1;
+
+        const el = document.createElement('div');
+        el.className = 'customer-item';
+        el.innerHTML =
+          `<div class="customer-num ${c.confidence}">${i + 1}</div>` +
+          `<div class="customer-info">` +
+            `<div class="customer-name">${escapeHtml(c.name)}</div>` +
+            `<div class="customer-address">${escapeHtml(c.street)} · ${escapeHtml(c.cityStateZip)}</div>` +
+            `<div class="customer-meta">` +
+              `<span class="confidence ${c.confidence}">${c.confidence.toUpperCase()}</span> ` +
+              `${c.state} · ${pageCount} pg` +
+            `</div>` +
+          `</div>` +
+          `<div class="page-badge">${pageRange}</div>`;
+
+        el.style.cursor = 'pointer';
+        el.onclick = () => scrollToPage(c.pageStart);
+        list.appendChild(el);
+      }
+
+      // Page text viewer
+      renderPageViewer();
+
+      // Manifest JSON
+      renderManifest(batchSize);
+    }
+
+    function renderPageViewer() {
+      const viewer = document.getElementById('pageViewer');
+      viewer.innerHTML = '';
+
+      // Build a set of boundary pages for highlighting
+      const boundaryPages = new Set(detectedCustomers.map(c => c.pageStart));
+
+      for (const page of pageTexts) {
+        const block = document.createElement('div');
+        block.className = 'page-block';
+        block.id = 'page-' + page.pageNum;
+
+        const isBoundary = boundaryPages.has(page.pageNum);
+        const customer = detectedCustomers.find(c => c.pageStart === page.pageNum);
+
+        let headerExtra = '';
+        if (isBoundary && customer) {
+          headerExtra = `<span style="color:var(--pass);font-weight:400;">▸ ${escapeHtml(customer.name)}</span>`;
+        }
+
+        const header = document.createElement('div');
+        header.className = 'page-block-header';
+        header.innerHTML = `<span>Page ${page.pageNum}${isBoundary ? ' ★' : ''}</span>${headerExtra}`;
+
+        const body = document.createElement('div');
+        body.className = 'page-block-body' + (page.pageNum > 3 ? ' collapsed' : '');
+
+        // Highlight detected address lines
+        let text = '';
+        for (const line of page.lines) {
+          const lineText = escapeHtml(line.text);
+          if (customer && customer.addressLines.some(al => line.text.trim() === al.trim())) {
+            text += `<span class="highlight-address">${lineText}</span>\n`;
+          } else {
+            text += lineText + '\n';
+          }
+        }
+
+        body.innerHTML = text;
+
+        header.onclick = () => body.classList.toggle('collapsed');
+        block.appendChild(header);
+        block.appendChild(body);
+        viewer.appendChild(block);
+      }
+    }
+
+    function renderManifest(batchSize) {
+      const batches = [];
+      for (let i = 0; i < detectedCustomers.length; i += batchSize) {
+        const batch = detectedCustomers.slice(i, i + batchSize);
+        batches.push({
+          batchNumber: Math.floor(i / batchSize) + 1,
+          customerCount: batch.length,
+          customers: batch.map((c, j) => ({
+            index: i + j + 1,
+            name: c.name,
+            street: c.street,
+            cityStateZip: c.cityStateZip,
+            state: c.state,
+            zip: c.zip,
+            pageStart: c.pageStart,
+            pageEnd: c.pageEnd,
+            pageCount: c.pageEnd - c.pageStart + 1,
+            confidence: c.confidence,
+          }))
+        });
+      }
+
+      const manifest = {
+        totalPages: pageTexts.length,
+        totalCustomers: detectedCustomers.length,
+        totalBatches: batches.length,
+        batchSize: batchSize,
+        confidenceSummary: {
+          strong: detectedCustomers.filter(c => c.confidence === 'strong').length,
+          medium: detectedCustomers.filter(c => c.confidence === 'medium').length,
+          weak: detectedCustomers.filter(c => c.confidence === 'weak').length,
+        },
+        batches: batches,
+      };
+
+      document.getElementById('manifestJson').textContent = JSON.stringify(manifest, null, 2);
+    }
+
+    function scrollToPage(pageNum) {
+      const el = document.getElementById('page-' + pageNum);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        // Expand the page block if collapsed
+        const body = el.querySelector('.page-block-body');
+        if (body) body.classList.remove('collapsed');
+      }
+    }
+
+    function switchResultTab(tab, btn) {
+      document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById('tab-' + tab).classList.add('active');
+      btn.classList.add('active');
+    }
+
+    function escapeHtml(str) {
+      return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+  </script>
+</body>
+</html>

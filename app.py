@@ -8,14 +8,51 @@ import os
 import re
 import json
 import tempfile
-from flask import Flask, request, jsonify, render_template_string
+import uuid
+import threading
+import shutil
+import time
+import zipfile
+from flask import Flask, request, jsonify, render_template_string, send_file, send_file
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 import io
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max
+
+# Job storage (in production, use Redis or a database)
+jobs = {}
+jobs_lock = threading.Lock()
+
+class Job:
+    def __init__(self, job_id, filename, batch_size):
+        self.job_id = job_id
+        self.filename = filename
+        self.batch_size = batch_size
+        self.status = "pending"  # pending, processing, done, error
+        self.progress = 0
+        self.total_pages = 0
+        self.pages_complete = 0
+        self.customers_found = 0
+        self.error = None
+        self.result_path = None
+        self.manifest = None
+        self.created_at = time.time()
+    
+    def to_dict(self):
+        return {
+            "jobId": self.job_id,
+            "filename": self.filename,
+            "status": self.status,
+            "progress": self.progress,
+            "totalPages": self.total_pages,
+            "pagesComplete": self.pages_complete,
+            "customersFound": self.customers_found,
+            "error": self.error,
+            "manifest": self.manifest if self.status == "done" else None,
+        }
 
 # US States for validation
 US_STATES = {
@@ -188,10 +225,14 @@ def detect_customer_on_page(lines, page_num, zone_top_pct=0, zone_bottom_pct=40)
     return None
 
 
-def process_pdf(pdf_path, batch_size=12):
+def process_pdf(pdf_path, batch_size=12, job=None):
     """Process PDF and detect all customer boundaries"""
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
+    
+    if job:
+        job.total_pages = total_pages
+        job.status = "processing"
     
     customers = []
     page_texts = []
@@ -213,6 +254,12 @@ def process_pdf(pdf_path, batch_size=12):
             existing_keys = [f"{c['name']}|{c['state']}|{c['zip']}" for c in customers]
             if key not in existing_keys:
                 customers.append(customer)
+        
+        # Update job progress
+        if job:
+            job.pages_complete = page_num + 1
+            job.progress = int(((page_num + 1) / total_pages) * 95)  # 95% for OCR, 5% for splitting
+            job.customers_found = len(customers)
     
     doc.close()
     
@@ -436,6 +483,77 @@ HTML_TEMPLATE = '''
     
     @keyframes spin { 100% { transform: rotate(360deg); } }
     
+    .progress-container {
+      margin-bottom: 16px;
+    }
+    
+    .progress-bar-bg {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      height: 28px;
+      overflow: hidden;
+    }
+    
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--pass));
+      transition: width 0.3s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    
+    .progress-text {
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--text-2);
+    }
+    
+    .progress-detail {
+      font-size: 12px;
+      color: var(--text-3);
+      margin-top: 4px;
+    }
+    
+    .download-section {
+      background: var(--pass-soft);
+      border: 1px solid var(--pass);
+      border-radius: 10px;
+      padding: 20px;
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    
+    .download-section h3 {
+      color: var(--pass);
+      font-size: 16px;
+      margin-bottom: 10px;
+    }
+    
+    .download-section p {
+      color: var(--text-2);
+      margin-bottom: 14px;
+    }
+    
+    .btn-download {
+      background: var(--pass);
+      color: white;
+      padding: 12px 28px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+    }
+    
+    .btn-download:hover {
+      filter: brightness(1.1);
+    }
+    
     .stats-bar {
       display: flex;
       gap: 16px;
@@ -630,16 +748,26 @@ HTML_TEMPLATE = '''
     
     <!-- Processing Panel -->
     <div class="panel hidden" id="processingPanel">
+      <div class="panel-header"><span>Processing</span><span id="processingJobId"></span></div>
       <div class="panel-body">
-        <div class="processing">
-          <div class="spinner"></div>
-          <span id="processingText">Processing PDF with OCR... This may take a minute.</span>
+        <div class="progress-container">
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="progressBar" style="width: 0%">0%</div>
+          </div>
+          <div class="progress-text" id="progressText">Starting OCR...</div>
+          <div class="progress-detail" id="progressDetail">Preparing document...</div>
         </div>
       </div>
     </div>
     
     <!-- Results Panel -->
     <div id="resultsPanel" class="hidden">
+      <div class="download-section" id="downloadSection">
+        <h3>✓ Processing Complete</h3>
+        <p id="downloadSummary">Ready to download</p>
+        <button class="btn-download" onclick="downloadResults()">Download Batch PDFs (ZIP)</button>
+      </div>
+      
       <div class="stats-bar" id="statsBar"></div>
       
       <div class="results-grid">
@@ -652,14 +780,8 @@ HTML_TEMPLATE = '''
         </div>
         
         <div class="panel">
-          <div class="tab-bar">
-            <button class="tab-btn active" onclick="switchTab('pages', this)">Page Text</button>
-            <button class="tab-btn" onclick="switchTab('manifest', this)">Manifest JSON</button>
-          </div>
-          <div class="tab-content active" id="tab-pages">
-            <div class="page-viewer" id="pageViewer"></div>
-          </div>
-          <div class="tab-content" id="tab-manifest">
+          <div class="panel-header"><span>Manifest</span></div>
+          <div class="panel-body">
             <pre class="manifest-json" id="manifestJson"></pre>
           </div>
         </div>
@@ -671,6 +793,9 @@ HTML_TEMPLATE = '''
     const fileInput = document.getElementById('fileInput');
     const processBtn = document.getElementById('processBtn');
     const uploadForm = document.getElementById('uploadForm');
+    
+    let currentJobId = null;
+    let pollInterval = null;
     
     fileInput.addEventListener('change', () => {
       if (fileInput.files.length > 0) {
@@ -685,11 +810,16 @@ HTML_TEMPLATE = '''
       
       document.getElementById('uploadPanel').classList.add('hidden');
       document.getElementById('processingPanel').classList.remove('hidden');
+      document.getElementById('progressBar').style.width = '0%';
+      document.getElementById('progressBar').textContent = '0%';
+      document.getElementById('progressText').textContent = 'Uploading file...';
+      document.getElementById('progressDetail').textContent = 'Starting job...';
       
       const formData = new FormData(uploadForm);
       
       try {
-        const response = await fetch('/process', {
+        // Start async job
+        const response = await fetch('/split', {
           method: 'POST',
           body: formData
         });
@@ -698,25 +828,89 @@ HTML_TEMPLATE = '''
         
         if (data.error) {
           alert('Error: ' + data.error);
-          document.getElementById('processingPanel').classList.add('hidden');
-          document.getElementById('uploadPanel').classList.remove('hidden');
+          resetToUpload();
           return;
         }
         
-        renderResults(data);
+        currentJobId = data.jobId;
+        document.getElementById('processingJobId').textContent = 'Job: ' + currentJobId;
+        document.getElementById('progressText').textContent = 'Job started, processing...';
         
-        document.getElementById('processingPanel').classList.add('hidden');
-        document.getElementById('resultsPanel').classList.remove('hidden');
+        // Start polling
+        pollInterval = setInterval(pollJobStatus, 1500);
         
       } catch (err) {
-        alert('Error processing PDF: ' + err.message);
-        document.getElementById('processingPanel').classList.add('hidden');
-        document.getElementById('uploadPanel').classList.remove('hidden');
+        alert('Error starting job: ' + err.message);
+        resetToUpload();
       }
     });
     
-    function renderResults(data) {
-      const { manifest, customers, pageTexts } = data;
+    async function pollJobStatus() {
+      if (!currentJobId) return;
+      
+      try {
+        const response = await fetch('/status/' + currentJobId);
+        const data = await response.json();
+        
+        if (data.error && !data.status) {
+          clearInterval(pollInterval);
+          alert('Error: ' + data.error);
+          resetToUpload();
+          return;
+        }
+        
+        // Update progress bar
+        const progress = data.progress || 0;
+        document.getElementById('progressBar').style.width = progress + '%';
+        document.getElementById('progressBar').textContent = progress + '%';
+        
+        // Update text
+        if (data.totalPages > 0) {
+          document.getElementById('progressText').textContent = 
+            `Processing page ${data.pagesComplete || 0} of ${data.totalPages}`;
+          document.getElementById('progressDetail').textContent = 
+            `${data.customersFound || 0} customers detected`;
+        }
+        
+        // Check if done
+        if (data.status === 'done') {
+          clearInterval(pollInterval);
+          renderResults(data.manifest);
+          document.getElementById('processingPanel').classList.add('hidden');
+          document.getElementById('resultsPanel').classList.remove('hidden');
+        } else if (data.status === 'error') {
+          clearInterval(pollInterval);
+          alert('Processing error: ' + (data.error || 'Unknown error'));
+          resetToUpload();
+        }
+        
+      } catch (err) {
+        console.error('Poll error:', err);
+        // Don't stop polling on network hiccups
+      }
+    }
+    
+    function resetToUpload() {
+      document.getElementById('processingPanel').classList.add('hidden');
+      document.getElementById('resultsPanel').classList.add('hidden');
+      document.getElementById('uploadPanel').classList.remove('hidden');
+      currentJobId = null;
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+    }
+    
+    function downloadResults() {
+      if (currentJobId) {
+        window.location.href = '/download/' + currentJobId;
+      }
+    }
+    
+    function renderResults(manifest) {
+      // Download summary
+      document.getElementById('downloadSummary').textContent = 
+        `${manifest.totalCustomers} customers split into ${manifest.totalBatches} batch PDFs`;
       
       // Stats bar
       document.getElementById('statsBar').innerHTML = `
@@ -737,7 +931,7 @@ HTML_TEMPLATE = '''
       for (const batch of manifest.batches) {
         const batchHeader = document.createElement('div');
         batchHeader.className = 'batch-header';
-        batchHeader.innerHTML = `<span>Batch ${batch.batchNumber}</span><span>${batch.customerCount} customers</span>`;
+        batchHeader.innerHTML = `<span>Batch ${batch.batchNumber} (${batch.filename})</span><span>${batch.customerCount} customers · ${batch.pageCount} pages</span>`;
         list.appendChild(batchHeader);
         
         for (const c of batch.customers) {
@@ -757,63 +951,12 @@ HTML_TEMPLATE = '''
             </div>
             <div class="page-badge">${pageRange}</div>
           `;
-          el.style.cursor = 'pointer';
-          el.onclick = () => scrollToPage(c.pageStart);
           list.appendChild(el);
         }
       }
       
-      // Page viewer
-      const viewer = document.getElementById('pageViewer');
-      viewer.innerHTML = '';
-      
-      const boundaryPages = new Set(customers.map(c => c.pageStart));
-      
-      for (const page of pageTexts) {
-        const block = document.createElement('div');
-        block.className = 'page-block';
-        block.id = 'page-' + page.pageNum;
-        
-        const isBoundary = boundaryPages.has(page.pageNum);
-        const customer = customers.find(c => c.pageStart === page.pageNum);
-        
-        const header = document.createElement('div');
-        header.className = 'page-block-header';
-        header.innerHTML = `
-          <span>Page ${page.pageNum}${isBoundary ? ' ★' : ''}</span>
-          ${customer ? `<span class="customer-tag">▸ ${escapeHtml(customer.name)}</span>` : ''}
-        `;
-        
-        const body = document.createElement('div');
-        body.className = 'page-block-body' + (page.pageNum > 3 ? ' collapsed' : '');
-        body.textContent = page.text;
-        
-        header.onclick = () => body.classList.toggle('collapsed');
-        
-        block.appendChild(header);
-        block.appendChild(body);
-        viewer.appendChild(block);
-      }
-      
       // Manifest JSON
       document.getElementById('manifestJson').textContent = JSON.stringify(manifest, null, 2);
-    }
-    
-    function scrollToPage(pageNum) {
-      const el = document.getElementById('page-' + pageNum);
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        const body = el.querySelector('.page-block-body');
-        if (body) body.classList.remove('collapsed');
-      }
-      switchTab('pages', document.querySelector('.tab-btn'));
-    }
-    
-    function switchTab(tab, btn) {
-      document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      document.getElementById('tab-' + tab).classList.add('active');
-      btn.classList.add('active');
     }
     
     function escapeHtml(str) {
@@ -855,33 +998,11 @@ def process():
         os.unlink(tmp_path)
 
 
-@app.route('/split', methods=['POST'])
-def split():
-    """
-    Process PDF, detect boundaries, split into batch files, return as zip.
-    This is the endpoint the QA Platform UI would call.
-    """
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-    
-    batch_size = int(request.form.get('batch_size', 12))
-    
-    # Create temp directories
-    tmp_dir = tempfile.mkdtemp()
-    output_dir = os.path.join(tmp_dir, 'batches')
-    os.makedirs(output_dir)
-    
-    # Save uploaded PDF
-    pdf_path = os.path.join(tmp_dir, 'input.pdf')
-    file.save(pdf_path)
-    
+def process_job_background(job, pdf_path, output_dir):
+    """Background worker to process a PDF job"""
     try:
         # Process and detect boundaries
-        result = process_pdf(pdf_path, batch_size)
+        result = process_pdf(pdf_path, job.batch_size, job)
         
         # Split into batch files
         batch_files = split_pdf_into_batches(
@@ -900,29 +1021,119 @@ def split():
             json.dump(manifest_with_files, f, indent=2)
         
         # Create zip file
-        zip_path = os.path.join(tmp_dir, 'batches.zip')
-        import zipfile
+        zip_path = os.path.join(output_dir, 'batches.zip')
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.write(manifest_path, 'manifest.json')
             for bf in batch_files:
                 zf.write(bf['path'], bf['filename'])
         
-        # Return zip file
-        from flask import send_file
-        return send_file(
-            zip_path,
-            mimetype='application/zip',
-            as_attachment=True,
-            download_name=f"batches_{file.filename.replace('.pdf', '')}.zip"
-        )
+        # Update job as complete
+        with jobs_lock:
+            job.status = "done"
+            job.progress = 100
+            job.result_path = zip_path
+            job.manifest = manifest_with_files
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        with jobs_lock:
+            job.status = "error"
+            job.error = str(e)
+    
     finally:
-        # Cleanup will happen after response is sent
-        import shutil
-        import atexit
-        atexit.register(lambda: shutil.rmtree(tmp_dir, ignore_errors=True))
+        # Clean up input PDF (but keep output dir for download)
+        if os.path.exists(pdf_path):
+            os.unlink(pdf_path)
+
+
+@app.route('/split', methods=['POST'])
+def split():
+    """
+    Start async PDF processing job.
+    Returns job ID immediately, process runs in background.
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    batch_size = int(request.form.get('batch_size', 12))
+    
+    # Create job
+    job_id = str(uuid.uuid4())[:8]
+    job = Job(job_id, file.filename, batch_size)
+    
+    # Create temp directories
+    tmp_dir = tempfile.mkdtemp()
+    output_dir = os.path.join(tmp_dir, 'batches')
+    os.makedirs(output_dir)
+    
+    # Save uploaded PDF
+    pdf_path = os.path.join(tmp_dir, 'input.pdf')
+    file.save(pdf_path)
+    
+    # Store job
+    with jobs_lock:
+        jobs[job_id] = job
+    
+    # Start background thread
+    thread = threading.Thread(
+        target=process_job_background,
+        args=(job, pdf_path, output_dir),
+        daemon=True
+    )
+    thread.start()
+    
+    return jsonify({
+        'jobId': job_id,
+        'status': 'pending',
+        'message': 'Job started. Poll /status/{jobId} for progress.'
+    })
+
+
+@app.route('/status/<job_id>', methods=['GET'])
+def status(job_id):
+    """Check job status and progress"""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    return jsonify(job.to_dict())
+
+
+@app.route('/download/<job_id>', methods=['GET'])
+def download(job_id):
+    """Download completed job result as ZIP"""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    if job.status != 'done':
+        return jsonify({'error': 'Job not complete', 'status': job.status}), 400
+    
+    if not job.result_path or not os.path.exists(job.result_path):
+        return jsonify({'error': 'Result file not found'}), 404
+    
+    return send_file(
+        job.result_path,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=f"batches_{job.filename.replace('.pdf', '')}.zip"
+    )
+
+
+@app.route('/jobs', methods=['GET'])
+def list_jobs():
+    """List all jobs (for debugging)"""
+    with jobs_lock:
+        return jsonify({
+            'jobs': [job.to_dict() for job in jobs.values()]
+        })
 
 
 if __name__ == '__main__':

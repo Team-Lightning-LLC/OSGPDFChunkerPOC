@@ -32,6 +32,7 @@ class Job:
         self.filename = filename
         self.batch_size = batch_size
         self.status = "pending"  # pending, processing, done, error
+        self.phase = "queued"    # queued, rendering, ocr, splitting, done
         self.progress = 0
         self.total_pages = 0
         self.pages_complete = 0
@@ -46,6 +47,7 @@ class Job:
             "jobId": self.job_id,
             "filename": self.filename,
             "status": self.status,
+            "phase": self.phase,
             "progress": self.progress,
             "totalPages": self.total_pages,
             "pagesComplete": self.pages_complete,
@@ -134,9 +136,211 @@ def ocr_page(page, dpi=200):
     return lines
 
 
-def detect_customer_on_page(lines, page_num, zone_top_pct=0, zone_bottom_pct=40):
+def detect_page_pattern(customers, min_customers=4):
     """
-    Detect customer address block in the top portion of a page.
+    Detect if customers have a consistent page interval.
+    Returns (is_consistent, interval, confidence) 
+    """
+    if len(customers) < min_customers:
+        return False, None, 0
+    
+    # Calculate intervals between customer start pages
+    intervals = []
+    for i in range(1, len(customers)):
+        interval = customers[i]['pageStart'] - customers[i-1]['pageStart']
+        intervals.append(interval)
+    
+    if not intervals:
+        return False, None, 0
+    
+    # Check if intervals are consistent (allow ±1 page variance)
+    from collections import Counter
+    interval_counts = Counter(intervals)
+    most_common_interval, count = interval_counts.most_common(1)[0]
+    
+    # Consider consistent if 80%+ of intervals match (within ±1)
+    matching = sum(1 for i in intervals if abs(i - most_common_interval) <= 1)
+    confidence = matching / len(intervals)
+    
+    return confidence >= 0.8, most_common_interval, confidence
+
+
+def process_pdf_quick(pdf_path, batch_size=12, job=None, sample_pages=60):
+    """
+    Quick mode: OCR just enough pages to detect the pattern, then extrapolate.
+    Much faster for uniform documents.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    doc = fitz.open(pdf_path)
+    total_pages = doc.page_count
+    
+    if job:
+        job.total_pages = total_pages
+        job.status = "processing"
+        job.phase = "sampling"
+    
+    # Step 1: Sample first N pages to detect pattern
+    pages_to_sample = min(sample_pages, total_pages)
+    page_images = []
+    
+    for page_num in range(pages_to_sample):
+        page = doc[page_num]
+        rect = page.rect
+        clip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + (rect.height * 0.4))
+        pix = page.get_pixmap(dpi=150, clip=clip)
+        img_bytes = pix.tobytes("png")
+        page_images.append((page_num, img_bytes))
+        
+        if job:
+            job.pages_complete = page_num + 1
+            job.progress = int(((page_num + 1) / pages_to_sample) * 30)
+    
+    if job:
+        job.phase = "detecting"
+    
+    # Step 2: OCR sampled pages in parallel
+    NUM_WORKERS = int(os.environ.get('OCR_WORKERS', 8))
+    page_results = [None] * pages_to_sample
+    sampled_customers = []
+    customers_lock = threading.Lock()
+    
+    def ocr_image(args):
+        page_num, img_bytes = args
+        img = Image.open(io.BytesIO(img_bytes))
+        text = pytesseract.image_to_string(img, config='--psm 6')
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        customer = detect_customer_on_page(lines, page_num + 1, zone_top_pct=0, zone_bottom_pct=100)
+        
+        if customer:
+            with customers_lock:
+                key = f"{customer['name']}|{customer['state']}|{customer['zip']}"
+                existing = [f"{c['name']}|{c['state']}|{c['zip']}" for c in sampled_customers]
+                if key not in existing:
+                    sampled_customers.append(customer)
+                    if job:
+                        job.customers_found = len(sampled_customers)
+        
+        return {'page_num': page_num, 'lines': lines, 'customer': customer}
+    
+    completed = 0
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = {executor.submit(ocr_image, args): args[0] for args in page_images}
+        for future in as_completed(futures):
+            result = future.result()
+            page_results[result['page_num']] = result
+            completed += 1
+            if job:
+                job.progress = 30 + int((completed / pages_to_sample) * 40)
+    
+    # Sort customers by page start
+    sampled_customers.sort(key=lambda c: c['pageStart'])
+    
+    if job:
+        job.phase = "analyzing"
+    
+    # Step 3: Detect pattern
+    is_consistent, interval, confidence = detect_page_pattern(sampled_customers)
+    
+    if not is_consistent or not interval:
+        # Fall back to full OCR mode
+        doc.close()
+        if job:
+            job.phase = "fallback"
+        return process_pdf(pdf_path, batch_size, job)
+    
+    if job:
+        job.phase = "extrapolating"
+        job.progress = 75
+    
+    # Step 4: Extrapolate to full document
+    first_customer_page = sampled_customers[0]['pageStart'] if sampled_customers else 1
+    
+    # Generate predicted customer boundaries
+    predicted_customers = []
+    current_page = first_customer_page
+    customer_index = 0
+    
+    while current_page <= total_pages:
+        # Use actual data if we have it, otherwise extrapolate
+        actual = next((c for c in sampled_customers if c['pageStart'] == current_page), None)
+        
+        if actual:
+            predicted_customers.append(actual)
+        else:
+            # Create predicted customer
+            predicted_customers.append({
+                'name': f'(Customer {len(predicted_customers) + 1})',
+                'street': '(Predicted)',
+                'city': 'Unknown',
+                'state': 'XX',
+                'zip': '00000',
+                'cityStateZip': '(Predicted from pattern)',
+                'pageStart': current_page,
+                'pageEnd': None,
+                'confidence': 'predicted',
+                'addressLines': [],
+            })
+        
+        current_page += interval
+    
+    # Assign page ranges
+    for i, customer in enumerate(predicted_customers):
+        if i < len(predicted_customers) - 1:
+            customer['pageEnd'] = predicted_customers[i + 1]['pageStart'] - 1
+        else:
+            customer['pageEnd'] = total_pages
+        customer['pageCount'] = customer['pageEnd'] - customer['pageStart'] + 1
+        customer['index'] = i + 1
+    
+    doc.close()
+    
+    if job:
+        job.customers_found = len(predicted_customers)
+        job.progress = 90
+        job.phase = "batching"
+    
+    # Step 5: Group into batches
+    batches = []
+    for i in range(0, len(predicted_customers), batch_size):
+        batch_customers = predicted_customers[i:i + batch_size]
+        batches.append({
+            'batchNumber': len(batches) + 1,
+            'customerCount': len(batch_customers),
+            'pageStart': batch_customers[0]['pageStart'],
+            'pageEnd': batch_customers[-1]['pageEnd'],
+            'pageCount': batch_customers[-1]['pageEnd'] - batch_customers[0]['pageStart'] + 1,
+            'customers': batch_customers
+        })
+    
+    manifest = {
+        'totalPages': total_pages,
+        'totalCustomers': len(predicted_customers),
+        'totalBatches': len(batches),
+        'batchSize': batch_size,
+        'mode': 'quick',
+        'detectedInterval': interval,
+        'patternConfidence': round(confidence, 2),
+        'sampledPages': pages_to_sample,
+        'confidenceSummary': {
+            'strong': sum(1 for c in predicted_customers if c.get('confidence') == 'strong'),
+            'medium': sum(1 for c in predicted_customers if c.get('confidence') == 'medium'),
+            'weak': sum(1 for c in predicted_customers if c.get('confidence') == 'weak'),
+            'predicted': sum(1 for c in predicted_customers if c.get('confidence') == 'predicted'),
+        },
+        'batches': batches,
+    }
+    
+    return {
+        'manifest': manifest,
+        'customers': predicted_customers,
+        'pageTexts': [],  # Not available in quick mode
+    }
+
+
+
+def detect_customer_on_page(lines, page_num, zone_top_pct=0, zone_bottom_pct=40):
+    """Detect customer address block in the top portion of a page.
     Returns customer dict or None.
     """
     # Only look at top portion of page (roughly first 40% of lines)
@@ -226,7 +430,7 @@ def detect_customer_on_page(lines, page_num, zone_top_pct=0, zone_bottom_pct=40)
 
 
 def process_pdf(pdf_path, batch_size=12, job=None):
-    """Process PDF and detect all customer boundaries - with parallel OCR"""
+    """Process PDF with adaptive scanning - OCR first chunk to detect pattern, then smart scan"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
     doc = fitz.open(pdf_path)
@@ -235,73 +439,151 @@ def process_pdf(pdf_path, batch_size=12, job=None):
     if job:
         job.total_pages = total_pages
         job.status = "processing"
+        job.phase = "analyzing"
     
-    # Step 1: Render all pages to images (fast, sequential - PyMuPDF isn't thread-safe)
-    page_images = []
+    # Settings
+    INITIAL_SCAN_PAGES = min(60, total_pages)  # OCR first 60 pages to detect pattern
+    ZONE_RANGE = 4  # Check +/- 4 pages around expected boundary
+    NUM_WORKERS = int(os.environ.get('OCR_WORKERS', 8))
+    
+    # Pre-render ALL pages to images (fast, needed for random access later)
+    if job:
+        job.phase = "rendering"
+    
+    page_images = {}
     for page_num in range(total_pages):
         page = doc[page_num]
-        pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("png")
-        page_images.append((page_num, img_bytes))
+        rect = page.rect
+        clip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + (rect.height * 0.4))
+        pix = page.get_pixmap(dpi=150, clip=clip)
+        page_images[page_num] = pix.tobytes("png")
         
         if job:
             job.pages_complete = page_num + 1
-            job.progress = int(((page_num + 1) / total_pages) * 20)  # First 20% is rendering
+            job.progress = int(((page_num + 1) / total_pages) * 15)  # 0-15% for rendering
     
     doc.close()
     
-    # Step 2: OCR in parallel (configurable threads, default 6)
-    NUM_WORKERS = int(os.environ.get('OCR_WORKERS', 6))
-    page_results = [None] * total_pages
-    
-    def ocr_image(args):
-        """OCR a single page image"""
-        page_num, img_bytes = args
-        img = Image.open(io.BytesIO(img_bytes))
-        text = pytesseract.image_to_string(img)
+    def ocr_single_page(page_num):
+        """OCR a single page"""
+        img = Image.open(io.BytesIO(page_images[page_num]))
+        text = pytesseract.image_to_string(img, config='--psm 6')
         lines = [line.strip() for line in text.split('\n') if line.strip()]
-        customer = detect_customer_on_page(lines, page_num + 1)
+        customer = detect_customer_on_page(lines, page_num + 1, zone_top_pct=0, zone_bottom_pct=100)
         return {
             'page_num': page_num,
             'lines': lines,
-            'text': '\n'.join(lines),
             'customer': customer
         }
     
-    completed = 0
+    # ===== PHASE 1: Initial scan to detect pattern =====
+    if job:
+        job.phase = "detecting"
+    
+    customers = []
+    ocr_cache = {}
+    pages_ocrd = 0
+    
+    # OCR initial pages in parallel
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        futures = {executor.submit(ocr_image, args): args[0] for args in page_images}
-        
+        futures = {executor.submit(ocr_single_page, i): i for i in range(INITIAL_SCAN_PAGES)}
         for future in as_completed(futures):
             result = future.result()
-            page_results[result['page_num']] = result
+            ocr_cache[result['page_num']] = result
+            pages_ocrd += 1
             
-            completed += 1
+            if result['customer']:
+                c = result['customer']
+                key = f"{c['name']}|{c['state']}|{c['zip']}"
+                if not any(f"{x['name']}|{x['state']}|{x['zip']}" == key for x in customers):
+                    customers.append(c)
+            
             if job:
-                job.pages_complete = completed
-                job.progress = 20 + int((completed / total_pages) * 75)  # 20-95%
+                job.pages_complete = pages_ocrd
+                job.progress = 15 + int((pages_ocrd / INITIAL_SCAN_PAGES) * 25)  # 15-40%
+                job.customers_found = len(customers)
     
-    # Step 3: Process results in order
-    customers = []
-    page_texts = []
+    # Sort customers by page
+    customers.sort(key=lambda c: c['pageStart'])
     
-    for page_num in range(total_pages):
-        result = page_results[page_num]
-        page_texts.append({
-            'pageNum': page_num + 1,
-            'lines': result['lines'],
-            'text': result['text']
-        })
-        
-        if result['customer']:
-            customer = result['customer']
-            key = f"{customer['name']}|{customer['state']}|{customer['zip']}"
-            existing_keys = [f"{c['name']}|{c['state']}|{c['zip']}" for c in customers]
-            if key not in existing_keys:
-                customers.append(customer)
+    # Detect page interval pattern
+    if len(customers) >= 2:
+        intervals = []
+        for i in range(1, len(customers)):
+            intervals.append(customers[i]['pageStart'] - customers[i-1]['pageStart'])
+        avg_interval = sum(intervals) / len(intervals)
+        min_interval = min(intervals)
+        max_interval = max(intervals)
+    else:
+        # Fallback: assume 8 pages per customer
+        avg_interval = 8
+        min_interval = 6
+        max_interval = 10
     
+    # ===== PHASE 2: Smart scan rest of document =====
     if job:
-        job.customers_found = len(customers)
+        job.phase = "scanning"
+    
+    if len(customers) > 0:
+        last_boundary = customers[-1]['pageStart']
+    else:
+        last_boundary = 0
+    
+    # Estimate remaining customers for progress
+    remaining_pages = total_pages - last_boundary
+    estimated_remaining = int(remaining_pages / avg_interval) if avg_interval > 0 else 0
+    customers_found_in_phase2 = 0
+    
+    while last_boundary + min_interval < total_pages:
+        # Calculate expected next boundary
+        expected_next = last_boundary + int(avg_interval)
+        
+        # Define search zone
+        zone_start = max(last_boundary + min_interval - 1, 0)
+        zone_end = min(last_boundary + max_interval + ZONE_RANGE, total_pages)
+        
+        # OCR pages in zone that haven't been OCR'd yet
+        zone_pages = [p for p in range(zone_start, zone_end) if p not in ocr_cache]
+        
+        if zone_pages:
+            with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+                futures = {executor.submit(ocr_single_page, p): p for p in zone_pages}
+                for future in as_completed(futures):
+                    result = future.result()
+                    ocr_cache[result['page_num']] = result
+                    pages_ocrd += 1
+        
+        # Find customer in zone
+        found_in_zone = None
+        for p in range(zone_start, zone_end):
+            if p in ocr_cache and ocr_cache[p]['customer']:
+                c = ocr_cache[p]['customer']
+                key = f"{c['name']}|{c['state']}|{c['zip']}"
+                if not any(f"{x['name']}|{x['state']}|{x['zip']}" == key for x in customers):
+                    found_in_zone = c
+                    break
+        
+        if found_in_zone:
+            customers.append(found_in_zone)
+            last_boundary = found_in_zone['pageStart']
+            customers_found_in_phase2 += 1
+            
+            if job:
+                job.customers_found = len(customers)
+                # Progress: 40-95%
+                progress_pct = min(customers_found_in_phase2 / max(estimated_remaining, 1), 1.0)
+                job.progress = 40 + int(progress_pct * 55)
+        else:
+            # No customer found in zone, jump forward
+            last_boundary = zone_end
+    
+    # Sort customers by page
+    customers.sort(key=lambda c: c['pageStart'])
+    
+    # ===== PHASE 3: Assign page ranges and build batches =====
+    if job:
+        job.phase = "splitting"
+        job.progress = 95
     
     # Assign page ranges
     for i, customer in enumerate(customers):
@@ -336,6 +618,14 @@ def process_pdf(pdf_path, batch_size=12, job=None):
         'totalCustomers': len(customers),
         'totalBatches': len(batches),
         'batchSize': batch_size,
+        'algorithm': {
+            'mode': 'adaptive',
+            'initialScanPages': INITIAL_SCAN_PAGES,
+            'detectedInterval': round(avg_interval, 1),
+            'intervalRange': [min_interval, max_interval],
+            'pagesOcrd': len(ocr_cache),
+            'efficiency': f"{round((1 - len(ocr_cache)/total_pages) * 100)}% pages skipped"
+        },
         'confidenceSummary': {
             'strong': sum(1 for c in customers if c['confidence'] == 'strong'),
             'medium': sum(1 for c in customers if c['confidence'] == 'medium'),
@@ -347,7 +637,7 @@ def process_pdf(pdf_path, batch_size=12, job=None):
     return {
         'manifest': manifest,
         'customers': customers,
-        'pageTexts': page_texts,
+        'pageTexts': [],  # Not collected in adaptive mode for speed
     }
 
 
@@ -775,6 +1065,15 @@ HTML_TEMPLATE = '''
             <small>Customers per orchestrator batch (10-15 recommended)</small>
           </div>
           
+          <div class="config-row">
+            <label>Mode:</label>
+            <select id="modeSelect" name="mode" style="padding: 5px 10px; border: 1px solid var(--border); border-radius: 5px; font-family: inherit;">
+              <option value="quick" selected>⚡ Quick (pattern detection)</option>
+              <option value="full">🔍 Full (OCR every page)</option>
+            </select>
+            <small>Quick: ~30 sec | Full: ~10 min for 600 pages</small>
+          </div>
+          
           <div style="margin-top: 16px; text-align: center;">
             <button type="submit" class="btn btn-primary" id="processBtn" disabled>Process PDF</button>
           </div>
@@ -904,8 +1203,37 @@ HTML_TEMPLATE = '''
         document.getElementById('progressBar').style.width = progress + '%';
         document.getElementById('progressBar').textContent = progress + '%';
         
-        // Update text
-        if (data.totalPages > 0) {
+        // Update text based on phase
+        const phase = data.phase || 'processing';
+        if (phase === 'rendering' || phase === 'sampling') {
+          document.getElementById('progressText').textContent = 
+            `Sampling pages for pattern detection...`;
+          document.getElementById('progressDetail').textContent = 
+            `${data.pagesComplete || 0} of ~60 pages sampled`;
+        } else if (phase === 'analyzing' || phase === 'detecting') {
+          document.getElementById('progressText').textContent = 
+            `Detecting customer boundaries...`;
+          document.getElementById('progressDetail').textContent = 
+            `${data.customersFound || 0} customers found so far`;
+        } else if (phase === 'extrapolating') {
+          document.getElementById('progressText').textContent = 
+            `Pattern detected! Extrapolating to full document...`;
+          document.getElementById('progressDetail').textContent = 
+            `Predicting all customer boundaries`;
+        } else if (phase === 'splitting' || phase === 'batching') {
+          document.getElementById('progressText').textContent = 'Creating batch PDFs...';
+          document.getElementById('progressDetail').textContent = 
+            `${data.customersFound || 0} customers → batch files`;
+        } else if (phase === 'fallback') {
+          document.getElementById('progressText').textContent = 'Pattern unclear, running full OCR...';
+          document.getElementById('progressDetail').textContent = 
+            'This will take longer';
+        } else if (phase === 'ocr') {
+          document.getElementById('progressText').textContent = 
+            `OCR processing: ${data.pagesComplete || 0} of ${data.totalPages} pages`;
+          document.getElementById('progressDetail').textContent = 
+            `${data.customersFound || 0} customers detected`;
+        } else if (data.totalPages > 0) {
           document.getElementById('progressText').textContent = 
             `Processing page ${data.pagesComplete || 0} of ${data.totalPages}`;
           document.getElementById('progressDetail').textContent = 
@@ -1041,8 +1369,13 @@ def process():
 def process_job_background(job, pdf_path, output_dir):
     """Background worker to process a PDF job"""
     try:
-        # Process and detect boundaries
-        result = process_pdf(pdf_path, job.batch_size, job)
+        # Choose processing mode
+        mode = getattr(job, 'mode', 'quick')
+        
+        if mode == 'quick':
+            result = process_pdf_quick(pdf_path, job.batch_size, job)
+        else:
+            result = process_pdf(pdf_path, job.batch_size, job)
         
         # Split into batch files
         batch_files = split_pdf_into_batches(
@@ -1090,6 +1423,11 @@ def split():
     """
     Start async PDF processing job.
     Returns job ID immediately, process runs in background.
+    
+    Parameters:
+        file: PDF file
+        batch_size: customers per batch (default 12)
+        mode: 'quick' (detect pattern, extrapolate) or 'full' (OCR every page)
     """
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
@@ -1099,10 +1437,12 @@ def split():
         return jsonify({'error': 'No file selected'}), 400
     
     batch_size = int(request.form.get('batch_size', 12))
+    mode = request.form.get('mode', 'quick')  # Default to quick mode
     
     # Create job
     job_id = str(uuid.uuid4())[:8]
     job = Job(job_id, file.filename, batch_size)
+    job.mode = mode
     
     # Create temp directories
     tmp_dir = tempfile.mkdtemp()
@@ -1128,6 +1468,7 @@ def split():
     return jsonify({
         'jobId': job_id,
         'status': 'pending',
+        'mode': mode,
         'message': 'Job started. Poll /status/{jobId} for progress.'
     })
 

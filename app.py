@@ -226,7 +226,9 @@ def detect_customer_on_page(lines, page_num, zone_top_pct=0, zone_bottom_pct=40)
 
 
 def process_pdf(pdf_path, batch_size=12, job=None):
-    """Process PDF and detect all customer boundaries"""
+    """Process PDF and detect all customer boundaries - with parallel OCR"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
     
@@ -234,34 +236,72 @@ def process_pdf(pdf_path, batch_size=12, job=None):
         job.total_pages = total_pages
         job.status = "processing"
     
+    # Step 1: Render all pages to images (fast, sequential - PyMuPDF isn't thread-safe)
+    page_images = []
+    for page_num in range(total_pages):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+        page_images.append((page_num, img_bytes))
+        
+        if job:
+            job.pages_complete = page_num + 1
+            job.progress = int(((page_num + 1) / total_pages) * 20)  # First 20% is rendering
+    
+    doc.close()
+    
+    # Step 2: OCR in parallel (configurable threads, default 6)
+    NUM_WORKERS = int(os.environ.get('OCR_WORKERS', 6))
+    page_results = [None] * total_pages
+    
+    def ocr_image(args):
+        """OCR a single page image"""
+        page_num, img_bytes = args
+        img = Image.open(io.BytesIO(img_bytes))
+        text = pytesseract.image_to_string(img)
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        customer = detect_customer_on_page(lines, page_num + 1)
+        return {
+            'page_num': page_num,
+            'lines': lines,
+            'text': '\n'.join(lines),
+            'customer': customer
+        }
+    
+    completed = 0
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = {executor.submit(ocr_image, args): args[0] for args in page_images}
+        
+        for future in as_completed(futures):
+            result = future.result()
+            page_results[result['page_num']] = result
+            
+            completed += 1
+            if job:
+                job.pages_complete = completed
+                job.progress = 20 + int((completed / total_pages) * 75)  # 20-95%
+    
+    # Step 3: Process results in order
     customers = []
     page_texts = []
     
     for page_num in range(total_pages):
-        page = doc[page_num]
-        lines = ocr_page(page)
+        result = page_results[page_num]
         page_texts.append({
             'pageNum': page_num + 1,
-            'lines': lines,
-            'text': '\n'.join(lines)
+            'lines': result['lines'],
+            'text': result['text']
         })
         
-        # Try to detect customer on this page
-        customer = detect_customer_on_page(lines, page_num + 1)
-        if customer:
-            # Check for duplicate (same name+state+zip already found)
+        if result['customer']:
+            customer = result['customer']
             key = f"{customer['name']}|{customer['state']}|{customer['zip']}"
             existing_keys = [f"{c['name']}|{c['state']}|{c['zip']}" for c in customers]
             if key not in existing_keys:
                 customers.append(customer)
-        
-        # Update job progress
-        if job:
-            job.pages_complete = page_num + 1
-            job.progress = int(((page_num + 1) / total_pages) * 95)  # 95% for OCR, 5% for splitting
-            job.customers_found = len(customers)
     
-    doc.close()
+    if job:
+        job.customers_found = len(customers)
     
     # Assign page ranges
     for i, customer in enumerate(customers):

@@ -5,9 +5,10 @@ Runs as a microservice. QA Platform sends PDFs here.
 Endpoints:
   POST /split                    — Split only, returns jobId (poll + download batches)
   POST /split-and-upload         — Split + upload batches to Vertesia, returns doc IDs
-  GET  /status/<jobId>           — Poll job progress
+  GET  /status/<jobId>           — Poll job progress (includes diagnostics on error)
   GET  /batch/<jobId>/<batchNum> — Download individual batch PDF
   GET  /download/<jobId>         — Download all batches as ZIP
+  POST /diagnose                 — Upload PDF, get detection diagnostics (no split)
   GET  /health                   — Health check
 
 Strategy: text extraction first (~2s for 600 pages), OCR fallback if needed.
@@ -63,6 +64,7 @@ class Job:
         self.manifest = None
         self.created_at = time.time()
         self.mode_used = None            # 'text' or 'ocr'
+        self.diagnostics = None          # debug info for troubleshooting
 
     def to_dict(self):
         return {
@@ -76,6 +78,7 @@ class Job:
             "customersFound": self.customers_found,
             "error": self.error,
             "modeUsed": self.mode_used,
+            "diagnostics": self.diagnostics,
             "manifest": self.manifest if self.status == "done" else None,
         }
 
@@ -219,7 +222,15 @@ def detect_boundaries_text(pdf_path, job=None):
 
     # No addresses found at all → no text layer or unrecognizable format
     if not csz_pages:
+        pages_with_text = sum(1 for p in range(total) if page_addr_details.get(p))
         doc.close()
+        if job:
+            job.diagnostics = {
+                'stage': 'text_scan',
+                'reason': 'no_addresses_found',
+                'total_pages': total,
+                'pages_with_any_content': pages_with_text,
+            }
         return None
 
     # --- Pass 2: classify corporate vs customer addresses ---
@@ -251,6 +262,14 @@ def detect_boundaries_text(pdf_path, job=None):
 
     if not boundaries:
         doc.close()
+        if job:
+            job.diagnostics = {
+                'stage': 'text_boundary_detect',
+                'reason': 'all_addresses_classified_corporate',
+                'all_addresses': {k: len(v) for k, v in csz_pages.items()},
+                'corporate_addresses': list(corp),
+                'surviving_addresses': [k for k in csz_pages if k not in corp],
+            }
         return None
 
     # --- Build customer list ---
@@ -376,6 +395,15 @@ def detect_boundaries_ocr(pdf_path, job=None):
     if job:
         job.phase = "text_extract"
         job.progress = 75
+        # Capture OCR diagnostics regardless of outcome
+        job.diagnostics = {
+            'stage': 'ocr',
+            'total_pages': total,
+            'pages_with_addresses': sum(1 for p in range(total) if page_ocr_addrs.get(p)),
+            'unique_addresses': {k: {'count': len(v), 'pages': sorted(v)[:10]} for k, v in csz_pages.items()},
+            'corporate_addresses': list(corp),
+            'surviving_addresses': [k for k in csz_pages if k not in corp],
+        }
 
     # --- Walk pages in order, find boundaries ---
     # Use CSZ alone for boundary detection; name is metadata, not the signal
@@ -395,6 +423,13 @@ def detect_boundaries_ocr(pdf_path, job=None):
         if csz and csz != current:
             boundaries.append(p)
             current = csz
+
+    if job:
+        job.diagnostics['boundaries_found'] = len(boundaries)
+        job.diagnostics['boundary_pages'] = [b + 1 for b in boundaries]
+        job.diagnostics['page_to_customer'] = {
+            str(p + 1): page_customer[p] for p in range(total) if page_customer[p]
+        }
 
     # --- Build customer list ---
     customers = []
@@ -444,6 +479,12 @@ def process_pdf(pdf_path, batch_size=12, job=None):
             job.phase = "ocr_fallback"
             job.mode_used = 'ocr'
         custs = detect_boundaries_ocr(pdf_path, job)
+
+    if not custs:
+        raise RuntimeError(
+            f"No customer boundaries detected in {job.filename if job else 'PDF'} "
+            f"(mode={mode}). Check diagnostics in /status for details."
+        )
 
     elapsed = time.time() - start
     if job:
@@ -661,6 +702,7 @@ def index():
             'GET /status/<jobId>': 'Poll progress (returns manifest when done)',
             'GET /batch/<jobId>/<batchNum>': 'Download individual batch PDF',
             'GET /download/<jobId>': 'Download all batches as ZIP',
+            'POST /diagnose': 'Upload PDF → get boundary detection diagnostics (no split)',
         },
     })
 
@@ -772,6 +814,60 @@ def download(jid):
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok', 'ocr_available': HAS_OCR})
+
+
+@app.route('/diagnose', methods=['POST', 'OPTIONS'])
+def diagnose():
+    """Upload a PDF and get boundary detection diagnostics without splitting.
+    Returns what addresses were found, what was classified corporate,
+    and where boundaries were detected."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    f = request.files['file']
+    if f.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+
+    td = tempfile.mkdtemp()
+    pp = os.path.join(td, 'input.pdf')
+    f.save(pp)
+
+    job = Job('diag', f.filename, 1)
+    try:
+        custs = detect_boundaries_text(pp, job)
+        if custs:
+            mode = 'text'
+        else:
+            mode = 'ocr'
+            if HAS_OCR:
+                custs = detect_boundaries_ocr(pp, job)
+            else:
+                custs = []
+
+        result = {
+            'filename': f.filename,
+            'mode': mode,
+            'customersFound': len(custs) if custs else 0,
+            'customers': [
+                {
+                    'index': c['index'], 'name': c['name'],
+                    'cityStateZip': c['cityStateZip'],
+                    'pageStart': c['pageStart'], 'pageEnd': c['pageEnd'],
+                    'pageCount': c['pageCount'], 'confidence': c['confidence'],
+                }
+                for c in (custs or [])
+            ],
+            'diagnostics': job.diagnostics,
+        }
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'diagnostics': job.diagnostics,
+        }), 500
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 
 if __name__ == '__main__':

@@ -181,6 +181,7 @@ def _classify_corporate_addresses(csz_pages):
 def detect_boundaries_text(pdf_path, job=None):
     doc = fitz.open(pdf_path)
     total = doc.page_count
+    print(f"[DETECT-TEXT] Starting text scan: {total} pages")
     if job:
         job.total_pages = total
         job.phase = "text_scan"
@@ -223,6 +224,8 @@ def detect_boundaries_text(pdf_path, job=None):
     # No addresses found at all → no text layer or unrecognizable format
     if not csz_pages:
         pages_with_text = sum(1 for p in range(total) if page_addr_details.get(p))
+        print(f"[DETECT-TEXT] No addresses found. Pages with any text content: {pages_with_text}/{total}")
+        print(f"[DETECT-TEXT] Falling back to OCR")
         doc.close()
         if job:
             job.diagnostics = {
@@ -235,6 +238,11 @@ def detect_boundaries_text(pdf_path, job=None):
 
     # --- Pass 2: classify corporate vs customer addresses ---
     corp = _classify_corporate_addresses(csz_pages)
+    print(f"[DETECT-TEXT] Addresses found: {len(csz_pages)} unique CSZs")
+    for csz, pages in csz_pages.items():
+        label = "CORP" if csz in corp else "CUST"
+        print(f"[DETECT-TEXT]   [{label}] {csz}: {len(pages)} pages")
+    print(f"[DETECT-TEXT] Corporate: {len(corp)}, Customer: {len(csz_pages) - len(corp)}")
 
     if job:
         job.phase = "text_extract"
@@ -261,6 +269,7 @@ def detect_boundaries_text(pdf_path, job=None):
             current = csz
 
     if not boundaries:
+        print(f"[DETECT-TEXT] No boundaries found after filtering. Falling back to OCR")
         doc.close()
         if job:
             job.diagnostics = {
@@ -271,6 +280,8 @@ def detect_boundaries_text(pdf_path, job=None):
                 'surviving_addresses': [k for k in csz_pages if k not in corp],
             }
         return None
+
+    print(f"[DETECT-TEXT] Boundaries: {len(boundaries)} at pages {[b+1 for b in boundaries]}")
 
     # --- Build customer list ---
     customers = []
@@ -322,6 +333,7 @@ def detect_boundaries_ocr(pdf_path, job=None):
 
     doc = fitz.open(pdf_path)
     total = doc.page_count
+    print(f"[DETECT-OCR] Starting OCR scan: {total} pages, clip=60%, workers={NUM_WORKERS}")
     if job:
         job.total_pages = total
         job.status = "processing"
@@ -392,6 +404,14 @@ def detect_boundaries_ocr(pdf_path, job=None):
     # --- Classify corporate vs customer (same logic as text path) ---
     corp = _classify_corporate_addresses(csz_pages)
 
+    print(f"[DETECT-OCR] OCR complete. Addresses found: {len(csz_pages)} unique CSZs")
+    for csz, pages in csz_pages.items():
+        label = "CORP" if csz in corp else "CUST"
+        print(f"[DETECT-OCR]   [{label}] {csz}: {len(pages)} pages (pages: {sorted(pages)[:10]})")
+    print(f"[DETECT-OCR] Corporate: {len(corp)}, Customer: {len(csz_pages) - len(corp)}")
+    pages_with_any = sum(1 for p in range(total) if page_ocr_addrs.get(p))
+    print(f"[DETECT-OCR] Pages with any address: {pages_with_any}/{total}")
+
     if job:
         job.phase = "text_extract"
         job.progress = 75
@@ -430,6 +450,10 @@ def detect_boundaries_ocr(pdf_path, job=None):
         job.diagnostics['page_to_customer'] = {
             str(p + 1): page_customer[p] for p in range(total) if page_customer[p]
         }
+
+    print(f"[DETECT-OCR] Boundaries: {len(boundaries)} at pages {[b+1 for b in boundaries]}")
+    if not boundaries:
+        print(f"[DETECT-OCR] *** NO BOUNDARIES FOUND — entire PDF will fail ***")
 
     # --- Build customer list ---
     customers = []
@@ -481,12 +505,15 @@ def process_pdf(pdf_path, batch_size=12, job=None):
         custs = detect_boundaries_ocr(pdf_path, job)
 
     if not custs:
-        raise RuntimeError(
+        msg = (
             f"No customer boundaries detected in {job.filename if job else 'PDF'} "
-            f"(mode={mode}). Check diagnostics in /status for details."
+            f"(mode={mode}). Check Railway logs for [DETECT-TEXT] / [DETECT-OCR] details."
         )
+        print(f"[PROCESS] *** FAILED: {msg}")
+        raise RuntimeError(msg)
 
     elapsed = time.time() - start
+    print(f"[PROCESS] Done: {len(custs)} customers found via {mode} in {elapsed:.1f}s")
     if job:
         job.phase = "batching"
         job.progress = 92

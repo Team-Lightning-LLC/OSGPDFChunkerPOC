@@ -843,13 +843,63 @@ def health():
     return jsonify({'status': 'ok', 'ocr_available': HAS_OCR})
 
 
-@app.route('/diagnose', methods=['POST', 'OPTIONS'])
+@app.route('/diagnose', methods=['GET', 'POST', 'OPTIONS'])
 def diagnose():
-    """Upload a PDF and get boundary detection diagnostics without splitting.
-    Returns what addresses were found, what was classified corporate,
-    and where boundaries were detected."""
+    """Upload a PDF and get boundary detection diagnostics without splitting."""
     if request.method == 'OPTIONS':
         return '', 204
+
+    if request.method == 'GET':
+        return '''<!DOCTYPE html>
+<html><head><title>PDF Chunker - Diagnose</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f5f5f5; }
+  h1 { color: #333; }
+  .upload-box { background: white; padding: 24px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin: 20px 0; }
+  input[type=file] { margin: 12px 0; }
+  button { background: #2563eb; color: white; border: none; padding: 10px 24px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button:hover { background: #1d4ed8; }
+  button:disabled { background: #93c5fd; cursor: wait; }
+  #status { margin: 16px 0; color: #666; }
+  pre { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 13px; max-height: 600px; overflow-y: auto; white-space: pre-wrap; }
+</style></head>
+<body>
+  <h1>PDF Chunker - Diagnose</h1>
+  <p>Upload a PDF to see what the boundary detector finds. No splitting or uploading happens.</p>
+  <div class="upload-box">
+    <input type="file" id="file" accept=".pdf"><br>
+    <button onclick="run()" id="btn">Run Diagnostics</button>
+    <div id="status"></div>
+  </div>
+  <pre id="result" style="display:none"></pre>
+  <script>
+    async function run() {
+      const file = document.getElementById('file').files[0];
+      if (!file) return alert('Pick a PDF first');
+      const btn = document.getElementById('btn');
+      const status = document.getElementById('status');
+      const result = document.getElementById('result');
+      btn.disabled = true;
+      status.textContent = 'Running detection (OCR may take a minute)...';
+      result.style.display = 'none';
+      const fd = new FormData();
+      fd.append('file', file);
+      try {
+        const resp = await fetch('/diagnose', { method: 'POST', body: fd });
+        const data = await resp.json();
+        result.textContent = JSON.stringify(data, null, 2);
+        result.style.display = 'block';
+        status.textContent = resp.ok
+          ? 'Done - ' + data.customersFound + ' customers found (' + data.mode + ' mode)'
+          : 'Error - ' + (data.error || 'unknown');
+      } catch (e) {
+        status.textContent = 'Request failed: ' + e.message;
+      }
+      btn.disabled = false;
+    }
+  </script>
+</body></html>''', 200, {'Content-Type': 'text/html'}
+
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     f = request.files['file']

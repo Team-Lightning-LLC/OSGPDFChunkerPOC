@@ -230,11 +230,12 @@ def detect_boundaries_text(pdf_path, job=None):
         job.progress = 35
 
     # --- Pass 3: walk pages, find customer address per page ---
+    # Use CSZ alone for boundary detection; name is metadata, not the signal
     page_customer = [None] * total
     page_detail = [None] * total
     for p in range(total):
         for a in page_addr_details[p]:
-            if a['csz_key'] not in corp and a['name']:
+            if a['csz_key'] not in corp:
                 page_customer[p] = a['csz_key']
                 page_detail[p] = a
                 break
@@ -311,7 +312,7 @@ def detect_boundaries_ocr(pdf_path, job=None):
     for p in range(total):
         pg = doc[p]
         r = pg.rect
-        clip = fitz.Rect(r.x0, r.y0, r.x1, r.y0 + (r.height * 0.4))
+        clip = fitz.Rect(r.x0, r.y0, r.x1, r.y0 + (r.height * 0.6))
         imgs[p] = pg.get_pixmap(dpi=150, clip=clip).tobytes("png")
         if job and p % 20 == 0:
             job.pages_complete = p + 1
@@ -331,11 +332,10 @@ def detect_boundaries_ocr(pdf_path, job=None):
         img = Image.open(io.BytesIO(imgs[p]))
         text = pytesseract.image_to_string(img, config='--psm 6')
         lines = [l.strip() for l in text.split('\n') if l.strip()]
-        zone = lines[:max(1, int(len(lines) * 0.4))]
 
         addrs = []
         seen = set()
-        for i, line in enumerate(zone):
+        for i, line in enumerate(lines):
             lc = clean_line(line)
             m = CITY_STATE_ZIP_RE.match(lc)
             if not m or m.group(2).upper() not in US_STATES:
@@ -349,7 +349,7 @@ def detect_boundaries_ocr(pdf_path, job=None):
             seen.add(key)
 
             name, street = _extract_address_from_lines(
-                [clean_line(z) for z in zone], i,
+                [clean_line(z) for z in lines], i,
             )
             addrs.append({
                 'csz_key': key, 'city': city, 'state': state, 'zip': zc,
@@ -378,11 +378,12 @@ def detect_boundaries_ocr(pdf_path, job=None):
         job.progress = 75
 
     # --- Walk pages in order, find boundaries ---
+    # Use CSZ alone for boundary detection; name is metadata, not the signal
     page_customer = [None] * total
     page_detail = [None] * total
     for p in range(total):
         for a in page_ocr_addrs.get(p, []):
-            if a['csz_key'] not in corp and a['name']:
+            if a['csz_key'] not in corp:
                 page_customer[p] = a['csz_key']
                 page_detail[p] = a
                 break

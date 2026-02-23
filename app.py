@@ -11,6 +11,9 @@ Endpoints:
   GET  /health                   — Health check
 
 Strategy: text extraction first (~2s for 600 pages), OCR fallback if needed.
+Boundary detection: address-frequency classification. Corporate addresses repeat
+across customer packets (multiple non-consecutive runs); customer addresses cluster
+in a single consecutive run. No hardcoded strings or exclusions.
 """
 
 import os, re, json, tempfile, uuid, threading, time, zipfile, io, shutil
@@ -78,7 +81,7 @@ class Job:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared address-parsing helpers
 # ---------------------------------------------------------------------------
 US_STATES = {
     'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN',
@@ -96,8 +99,11 @@ NON_NAME_PATTERNS = [re.compile(p, re.I) for p in [
     r'^P\.?\s*O\.?\s*BOX', r'^SUITE', r'^APT', r'^DEPT', r'^ATTN', r'^RE:',
     r'^RETURN\s+SERVICE', r'^FIRST.?CLASS', r'^PRESORTED',
     r'^U\.?S\.?\s*POSTAGE', r'^\d+\s*$', r'^[A-Z]{2}\s+\d',
-    r'^[\d\s\-\+]+$', r'Corporate Drive', r'Lake Zurich',
+    r'^[\d\s\-\+]+$', r'(?i)corporate\s+drive', r'(?i)department',
+    r'(?i)customer\s+service', r'(?i)mortgage', r'(?i)servic(?:er|ing)',
+    r'(?i)payment\s+address', r'(?i)P\.?\s*O\.?\s*Box',
 ]]
+LOAN_RE = re.compile(r'(?:Old|New|Loan)\s*(?:Loan\s*)?Number\s*[:\-]?\s*(\d[\d\-]+)', re.I)
 NUM_WORKERS = int(os.environ.get('OCR_WORKERS', 8))
 
 
@@ -119,6 +125,53 @@ def clean_line(t):
     return c or t
 
 
+def _extract_address_from_lines(lines, i):
+    """Given lines and index i of a CSZ match, extract name + street above it."""
+    name = street = None
+    if i >= 1 and STREET_RE.match(lines[i - 1].strip()):
+        street = lines[i - 1].strip()
+        if i >= 2 and is_likely_person_name(lines[i - 2].strip()):
+            name = lines[i - 2].strip()
+            if i >= 3 and is_likely_person_name(lines[i - 3].strip()):
+                name = f"{lines[i - 3].strip()} / {name}"
+    elif i >= 1 and is_likely_person_name(lines[i - 1].strip()):
+        name = lines[i - 1].strip()
+    return name, street
+
+
+def _extract_loans_from_text(text):
+    """Pull Old/New Loan Numbers from page text."""
+    lo = ln = None
+    for line in text.split('\n'):
+        if 'old' in line.lower() and 'loan' in line.lower():
+            m = LOAN_RE.search(line)
+            if m:
+                lo = m.group(1)
+        if 'new' in line.lower() and 'loan' in line.lower():
+            m = LOAN_RE.search(line)
+            if m:
+                ln = m.group(1)
+    return lo, ln
+
+
+def _classify_corporate_addresses(csz_pages):
+    """
+    Corporate addresses appear in multiple non-consecutive page runs
+    (they repeat across different customer packets). Customer addresses
+    appear in a single consecutive run.
+    """
+    corp = set()
+    for csz, pages in csz_pages.items():
+        pages_sorted = sorted(set(pages))
+        runs = 1
+        for i in range(1, len(pages_sorted)):
+            if pages_sorted[i] - pages_sorted[i - 1] > 1:
+                runs += 1
+        if runs > 1:
+            corp.add(csz)
+    return corp
+
+
 # ---------------------------------------------------------------------------
 # Text extraction (fast path — ~1-2 sec for 600 pages)
 # ---------------------------------------------------------------------------
@@ -130,108 +183,112 @@ def detect_boundaries_text(pdf_path, job=None):
         job.phase = "text_scan"
         job.status = "processing"
 
-    bpages = []
-    for i in range(total):
-        if "NOTICE OF SERVICING TRANSFER" in doc[i].get_text():
-            bpages.append(i)
-        if job and i % 50 == 0:
-            job.progress = int((i / total) * 30)
+    # --- Pass 1: extract all addresses from every page ---
+    page_addr_details = {}  # page -> list of address dicts
+    csz_pages = {}          # csz_key -> list of pages it appears on
 
-    if len(bpages) < 2:
+    for p in range(total):
+        text = doc[p].get_text()
+        if not text.strip():
+            page_addr_details[p] = []
+            continue
+
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        addrs = []
+        seen = set()
+        for i, line in enumerate(lines):
+            m = CITY_STATE_ZIP_RE.match(line)
+            if not m or m.group(2) not in US_STATES:
+                continue
+            city, state, zc = m.group(1).strip(), m.group(2), m.group(3)
+            key = f"{city.upper()}, {state} {zc}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            name, street = _extract_address_from_lines(lines, i)
+            addrs.append({
+                'csz_key': key, 'city': city, 'state': state, 'zip': zc,
+                'name': name, 'street': street or '',
+            })
+            csz_pages.setdefault(key, []).append(p)
+
+        page_addr_details[p] = addrs
+        if job and p % 50 == 0:
+            job.progress = int((p / total) * 30)
+
+    # No addresses found at all → no text layer or unrecognizable format
+    if not csz_pages:
         doc.close()
         return None
+
+    # --- Pass 2: classify corporate vs customer addresses ---
+    corp = _classify_corporate_addresses(csz_pages)
 
     if job:
         job.phase = "text_extract"
         job.progress = 35
 
+    # --- Pass 3: walk pages, find customer address per page ---
+    page_customer = [None] * total
+    page_detail = [None] * total
+    for p in range(total):
+        for a in page_addr_details[p]:
+            if a['csz_key'] not in corp and a['name']:
+                page_customer[p] = a['csz_key']
+                page_detail[p] = a
+                break
+
+    # --- Pass 4: boundaries where customer address changes ---
+    boundaries = []
+    current = None
+    for p in range(total):
+        csz = page_customer[p]
+        if csz and csz != current:
+            boundaries.append(p)
+            current = csz
+
+    if not boundaries:
+        doc.close()
+        return None
+
+    # --- Build customer list ---
     customers = []
-    for idx, pg in enumerate(bpages):
-        text = doc[pg].get_text()
+    for idx, start in enumerate(boundaries):
+        end = boundaries[idx + 1] - 1 if idx + 1 < len(boundaries) else total - 1
+        d = page_detail[start]
+
+        # Extract loan numbers from boundary page and neighbors
         lo = ln = None
-        for line in text.split('\n'):
-            if 'Old Loan Number' in line:
-                lo = line.split(':')[-1].strip()
-            if 'New Loan Number' in line:
-                ln = line.split(':')[-1].strip()
+        for scan_p in range(start, min(start + 3, total)):
+            plo, pln = _extract_loans_from_text(doc[scan_p].get_text())
+            if plo and not lo:
+                lo = plo
+            if pln and not ln:
+                ln = pln
 
-        name = street = csz = city = state = zc = None
-        addr = []
-        for off in range(1, 4):
-            if pg + off >= total:
-                break
-            lines = [l.strip() for l in doc[pg + off].get_text().split('\n') if l.strip()]
-            for j, line in enumerate(lines):
-                if 'next payment' in line.lower():
-                    parsed = _parse_address_block(lines[j + 1:])
-                    if parsed:
-                        name = parsed['name']
-                        street = parsed.get('street')
-                        city = parsed.get('city')
-                        state = parsed.get('state')
-                        zc = parsed.get('zip')
-                        csz = parsed.get('cityStateZip')
-                        addr = parsed.get('addressLines', [])
-                    break
-            if name:
-                break
-
-        pe = bpages[idx + 1] if idx + 1 < len(bpages) else total
         customers.append({
-            'name': name or '(Not detected)',
-            'street': street or '',
-            'city': city or '',
-            'state': state or 'XX',
-            'zip': zc or '00000',
-            'cityStateZip': csz or '',
+            'name': d['name'] or '(Not detected)',
+            'street': d['street'],
+            'city': d['city'],
+            'state': d['state'],
+            'zip': d['zip'],
+            'cityStateZip': d['csz_key'],
             'loanOld': lo,
             'loanNew': ln,
-            'pageStart': pg + 1,
-            'pageEnd': pe,
-            'pageCount': pe - pg,
-            'confidence': 'strong' if name and street else 'medium' if name else 'weak',
-            'addressLines': addr,
+            'pageStart': start + 1,
+            'pageEnd': end + 1,
+            'pageCount': end - start + 1,
+            'confidence': 'strong' if d['name'] and d['street'] else 'medium' if d['name'] else 'weak',
+            'addressLines': [l for l in [d['name'], d['street'], d['csz_key']] if l],
             'index': idx + 1,
         })
         if job:
             job.customers_found = len(customers)
-            job.progress = 35 + int((idx / len(bpages)) * 55)
+            job.progress = 35 + int((idx / len(boundaries)) * 55)
 
     doc.close()
     return customers
-
-
-def _parse_address_block(lines):
-    if not lines:
-        return None
-    for i, line in enumerate(lines):
-        m = CITY_STATE_ZIP_RE.match(line)
-        if m and m.group(2) in US_STATES:
-            city, state, zc = m.group(1).strip(), m.group(2), m.group(3)
-            if 'ZURICH' in city.upper() or 'GREENVILLE' in city.upper():
-                continue
-            r = {
-                'city': city, 'state': state, 'zip': zc,
-                'cityStateZip': f"{city}, {state} {zc}", 'addressLines': [],
-            }
-            if i >= 1 and STREET_RE.match(lines[i - 1]):
-                r['street'] = lines[i - 1]
-                if i >= 2 and is_likely_person_name(lines[i - 2]):
-                    r['name'] = (
-                        f"{lines[i - 3]} / {lines[i - 2]}"
-                        if i >= 3 and is_likely_person_name(lines[i - 3])
-                        else lines[i - 2]
-                    )
-                elif i >= 2:
-                    r['name'] = lines[i - 2]
-            elif i >= 1 and is_likely_person_name(lines[i - 1]):
-                r['name'] = lines[i - 1]
-            if r.get('name'):
-                r['addressLines'] = [
-                    l for l in [r.get('name'), r.get('street'), r['cityStateZip']] if l
-                ]
-                return r
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -264,80 +321,106 @@ def detect_boundaries_ocr(pdf_path, job=None):
     if job:
         job.phase = "ocr"
 
-    custs = []
-    cl = threading.Lock()
+    # --- OCR all pages, collect raw address hits ---
+    page_ocr_addrs = {}  # page -> list of address dicts
+    csz_pages = {}       # csz -> list of pages
+    ocr_lock = threading.Lock()
     done = [0]
 
-    def ocr(p):
+    def ocr_page(p):
         img = Image.open(io.BytesIO(imgs[p]))
         text = pytesseract.image_to_string(img, config='--psm 6')
         lines = [l.strip() for l in text.split('\n') if l.strip()]
-        c = _detect_ocr(lines, p + 1)
-        if c:
-            with cl:
-                k = f"{c['name']}|{c['state']}|{c['zip']}"
-                if not any(f"{x['name']}|{x['state']}|{x['zip']}" == k for x in custs):
-                    custs.append(c)
+        zone = lines[:max(1, int(len(lines) * 0.4))]
+
+        addrs = []
+        seen = set()
+        for i, line in enumerate(zone):
+            lc = clean_line(line)
+            m = CITY_STATE_ZIP_RE.match(lc)
+            if not m or m.group(2).upper() not in US_STATES:
+                continue
+            city = m.group(1).strip()
+            state = m.group(2).upper()
+            zc = m.group(3)
+            key = f"{city.upper()}, {state} {zc}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            name, street = _extract_address_from_lines(
+                [clean_line(z) for z in zone], i,
+            )
+            addrs.append({
+                'csz_key': key, 'city': city, 'state': state, 'zip': zc,
+                'name': name, 'street': street or '',
+            })
+
+        with ocr_lock:
+            page_ocr_addrs[p] = addrs
+            for a in addrs:
+                csz_pages.setdefault(a['csz_key'], []).append(p)
+
         done[0] += 1
         if job and done[0] % 10 == 0:
             job.pages_complete = done[0]
-            job.customers_found = len(custs)
-            job.progress = 15 + int((done[0] / total) * 75)
+            job.progress = 15 + int((done[0] / total) * 55)
 
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
-        for f in as_completed([ex.submit(ocr, p) for p in range(total)]):
+        for f in as_completed([ex.submit(ocr_page, p) for p in range(total)]):
             f.result()
 
-    custs.sort(key=lambda c: c['pageStart'])
-    for i, c in enumerate(custs):
-        c['pageEnd'] = custs[i + 1]['pageStart'] - 1 if i + 1 < len(custs) else total
-        c['pageCount'] = c['pageEnd'] - c['pageStart'] + 1
-        c['index'] = i + 1
-    return custs
+    # --- Classify corporate vs customer (same logic as text path) ---
+    corp = _classify_corporate_addresses(csz_pages)
 
+    if job:
+        job.phase = "text_extract"
+        job.progress = 75
 
-def _detect_ocr(lines, pnum):
-    zone = lines[:max(1, int(len(lines) * 0.4))]
-    for i, line in enumerate(zone):
-        lc = clean_line(line.strip())
-        m = CITY_STATE_ZIP_RE.match(lc)
-        if not m:
-            continue
-        city, state, zc = m.group(1).strip(), m.group(2).upper(), m.group(3)
-        if state not in US_STATES or 'ZURICH' in city.upper() or 'GREENVILLE' in city.upper():
-            continue
-        street = name = None
-        conf = 'weak'
-        al = [lc]
-        if i >= 1:
-            prev = clean_line(zone[i - 1].strip())
-            if STREET_RE.match(prev):
-                street = prev
-                al.insert(0, street)
-                if i >= 2:
-                    nl = clean_line(zone[i - 2].strip())
-                    if is_likely_person_name(nl):
-                        name = nl
-                        conf = 'strong'
-                        if i >= 3:
-                            co = clean_line(zone[i - 3].strip())
-                            if is_likely_person_name(co):
-                                name = f"{co} / {nl}"
-                        al.insert(0, name)
-                if not name:
-                    conf = 'medium'
-            elif is_likely_person_name(prev):
-                name = prev
-                conf = 'medium'
-                al.insert(0, name)
-        return {
-            'name': name or '(Not detected)', 'street': street or '',
-            'city': city, 'state': state, 'zip': zc,
-            'cityStateZip': f"{city}, {state} {zc}",
-            'pageStart': pnum, 'pageEnd': None,
-            'confidence': conf, 'addressLines': al,
-        }
-    return None
+    # --- Walk pages in order, find boundaries ---
+    page_customer = [None] * total
+    page_detail = [None] * total
+    for p in range(total):
+        for a in page_ocr_addrs.get(p, []):
+            if a['csz_key'] not in corp and a['name']:
+                page_customer[p] = a['csz_key']
+                page_detail[p] = a
+                break
+
+    boundaries = []
+    current = None
+    for p in range(total):
+        csz = page_customer[p]
+        if csz and csz != current:
+            boundaries.append(p)
+            current = csz
+
+    # --- Build customer list ---
+    customers = []
+    for idx, start in enumerate(boundaries):
+        end = boundaries[idx + 1] - 1 if idx + 1 < len(boundaries) else total - 1
+        d = page_detail[start]
+        customers.append({
+            'name': d['name'] or '(Not detected)',
+            'street': d['street'],
+            'city': d['city'],
+            'state': d['state'],
+            'zip': d['zip'],
+            'cityStateZip': d['csz_key'],
+            'loanOld': None,
+            'loanNew': None,
+            'pageStart': start + 1,
+            'pageEnd': end + 1,
+            'pageCount': end - start + 1,
+            'confidence': 'strong' if d['name'] and d['street'] else 'medium' if d['name'] else 'weak',
+            'addressLines': [l for l in [d['name'], d['street'], d['csz_key']] if l],
+            'index': idx + 1,
+        })
+        if job:
+            job.customers_found = len(customers)
+            job.progress = 75 + int((idx / max(1, len(boundaries))) * 15)
+
+    return customers
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +433,7 @@ def process_pdf(pdf_path, batch_size=12, job=None):
         job.status = "processing"
 
     custs = detect_boundaries_text(pdf_path, job)
-    if custs and len(custs) >= 2:
+    if custs:
         mode = 'text'
         if job:
             job.mode_used = 'text'

@@ -157,11 +157,14 @@ def _extract_loans_from_text(text):
     return lo, ln
 
 
-def _classify_corporate_addresses(csz_pages):
+def _classify_corporate_addresses(csz_pages, total_pages):
     """
-    Corporate addresses appear in multiple non-consecutive page runs
-    (they repeat across different customer packets). Customer addresses
-    appear in a single consecutive run.
+    Corporate addresses appear across a large fraction of the document
+    (on nearly every customer packet). Customer addresses — even if shared
+    by a few customers in the same city — appear on a small fraction.
+
+    Heuristic: corporate if the address appears in non-consecutive runs
+    AND covers more than 20% of total pages.
     """
     corp = set()
     for csz, pages in csz_pages.items():
@@ -170,7 +173,8 @@ def _classify_corporate_addresses(csz_pages):
         for i in range(1, len(pages_sorted)):
             if pages_sorted[i] - pages_sorted[i - 1] > 1:
                 runs += 1
-        if runs > 1:
+        page_fraction = len(pages_sorted) / total_pages
+        if runs > 1 and page_fraction > 0.2:
             corp.add(csz)
     return corp
 
@@ -237,7 +241,7 @@ def detect_boundaries_text(pdf_path, job=None):
         return None
 
     # --- Pass 2: classify corporate vs customer addresses ---
-    corp = _classify_corporate_addresses(csz_pages)
+    corp = _classify_corporate_addresses(csz_pages, total)
     print(f"[DETECT-TEXT] Addresses found: {len(csz_pages)} unique CSZs")
     for csz, pages in csz_pages.items():
         label = "CORP" if csz in corp else "CUST"
@@ -249,12 +253,14 @@ def detect_boundaries_text(pdf_path, job=None):
         job.progress = 35
 
     # --- Pass 3: walk pages, find customer address per page ---
-    # Use CSZ alone for boundary detection; name is metadata, not the signal
+    # Text path: require name since text extraction gives clean names.
+    # This filters out corporate addresses that lack person names
+    # (e.g. "P.O. Box 10826" / "1 Corporate Drive").
     page_customer = [None] * total
     page_detail = [None] * total
     for p in range(total):
         for a in page_addr_details[p]:
-            if a['csz_key'] not in corp:
+            if a['csz_key'] not in corp and a['name']:
                 page_customer[p] = a['csz_key']
                 page_detail[p] = a
                 break
@@ -282,6 +288,41 @@ def detect_boundaries_text(pdf_path, job=None):
         return None
 
     print(f"[DETECT-TEXT] Boundaries: {len(boundaries)} at pages {[b+1 for b in boundaries]}")
+
+    # Always populate diagnostics for visibility
+    if job:
+        addr_analysis = {}
+        for k, v in csz_pages.items():
+            pages_sorted = sorted(set(v))
+            runs = 1
+            for i in range(1, len(pages_sorted)):
+                if pages_sorted[i] - pages_sorted[i-1] > 1:
+                    runs += 1
+            # Check if any occurrence had a name
+            has_name = any(
+                a['name'] for p in pages_sorted
+                for a in page_addr_details.get(p, []) if a['csz_key'] == k
+            )
+            addr_analysis[k] = {
+                'pages': pages_sorted[:20],
+                'page_count': len(pages_sorted),
+                'runs': runs,
+                'fraction': round(len(pages_sorted) / total, 3),
+                'is_corporate': k in corp,
+                'has_person_name': has_name,
+            }
+        job.diagnostics = {
+            'stage': 'text_boundary_detect',
+            'total_pages': total,
+            'address_analysis': addr_analysis,
+            'corporate_addresses': list(corp),
+            'surviving_addresses': [k for k in csz_pages if k not in corp],
+            'boundaries_found': len(boundaries),
+            'boundary_pages': [b + 1 for b in boundaries],
+            'page_to_customer': {
+                str(p + 1): page_customer[p] for p in range(total) if page_customer[p]
+            },
+        }
 
     # --- Build customer list ---
     customers = []
@@ -402,7 +443,7 @@ def detect_boundaries_ocr(pdf_path, job=None):
             f.result()
 
     # --- Classify corporate vs customer (same logic as text path) ---
-    corp = _classify_corporate_addresses(csz_pages)
+    corp = _classify_corporate_addresses(csz_pages, total)
 
     print(f"[DETECT-OCR] OCR complete. Addresses found: {len(csz_pages)} unique CSZs")
     for csz, pages in csz_pages.items():
@@ -556,13 +597,16 @@ def process_pdf(pdf_path, batch_size=12, job=None):
 # ---------------------------------------------------------------------------
 # PDF splitting
 # ---------------------------------------------------------------------------
-def split_pdf_into_batches(pdf_path, batches, output_dir):
+def split_pdf_into_batches(pdf_path, batches, output_dir, naming_prefix=None):
     doc = fitz.open(pdf_path)
     files = []
     for b in batches:
         bd = fitz.open()
         bd.insert_pdf(doc, from_page=b['pageStart'] - 1, to_page=b['pageEnd'] - 1)
-        fn = f"batch_{b['batchNumber']:03d}.pdf"
+        if naming_prefix:
+            fn = f"{naming_prefix}_Batch_{b['batchNumber']:03d}.pdf"
+        else:
+            fn = f"batch_{b['batchNumber']:03d}.pdf"
         fp = os.path.join(output_dir, fn)
         bd.save(fp)
         bd.close()
@@ -630,11 +674,16 @@ def upload_to_vertesia(file_path, filename, jwt_token, collection_id=None):
 # ---------------------------------------------------------------------------
 # Background workers
 # ---------------------------------------------------------------------------
-def job_split_only(job, pdf_path, output_dir):
+def job_split_only(job, pdf_path, output_dir, client_name='', project=''):
     """Background worker for /split — split PDF, create ZIP for download."""
     try:
+        parts = [p for p in [client_name, project] if p]
+        naming_prefix = '_'.join(parts).replace(' ', '_') if parts else None
+
         result = process_pdf(pdf_path, job.batch_size, job)
-        bf = split_pdf_into_batches(pdf_path, result['manifest']['batches'], output_dir)
+        bf = split_pdf_into_batches(
+            pdf_path, result['manifest']['batches'], output_dir, naming_prefix,
+        )
 
         manifest = {**result['manifest']}
         manifest['batches'] = [{k: v for k, v in b.items() if k != 'path'} for b in bf]
@@ -667,11 +716,18 @@ def job_split_only(job, pdf_path, output_dir):
             os.unlink(pdf_path)
 
 
-def job_split_and_upload(job, pdf_path, output_dir, vertesia_jwt, collection_id=None):
+def job_split_and_upload(job, pdf_path, output_dir, vertesia_jwt,
+                         collection_id=None, client_name='', project=''):
     """Background worker for /split-and-upload — split PDF, upload to Vertesia."""
     try:
+        # Build naming prefix: "ClientName_Project" or just "ClientName" or fallback
+        parts = [p for p in [client_name, project] if p]
+        naming_prefix = '_'.join(parts).replace(' ', '_') if parts else None
+
         result = process_pdf(pdf_path, job.batch_size, job)
-        bf = split_pdf_into_batches(pdf_path, result['manifest']['batches'], output_dir)
+        bf = split_pdf_into_batches(
+            pdf_path, result['manifest']['batches'], output_dir, naming_prefix,
+        )
 
         # Upload phase
         job.phase = "uploading"
@@ -698,6 +754,10 @@ def job_split_and_upload(job, pdf_path, output_dir, vertesia_jwt, collection_id=
         manifest = {**result['manifest']}
         manifest['batches'] = [{k: v for k, v in b.items() if k != 'path'} for b in bf]
         manifest['documentIds'] = document_ids
+        if client_name:
+            manifest['clientName'] = client_name
+        if project:
+            manifest['project'] = project
 
         with jobs_lock:
             job.status = "done"
@@ -745,6 +805,8 @@ def split():
         return jsonify({'error': 'No file selected'}), 400
 
     batch_size = int(request.form.get('batch_size', 12))
+    client_name = request.form.get('client_name', '').strip()
+    project = request.form.get('project', '').strip()
     job_id = str(uuid.uuid4())[:8]
     job = Job(job_id, f.filename, batch_size)
 
@@ -757,7 +819,11 @@ def split():
     with jobs_lock:
         jobs[job_id] = job
 
-    threading.Thread(target=job_split_only, args=(job, pp, od), daemon=True).start()
+    threading.Thread(
+        target=job_split_only,
+        args=(job, pp, od, client_name, project),
+        daemon=True,
+    ).start()
     return jsonify({'jobId': job_id, 'status': 'pending'})
 
 
@@ -778,6 +844,8 @@ def split_and_upload():
 
     batch_size = int(request.form.get('batch_size', 12))
     collection_id = request.form.get('collection_id')
+    client_name = request.form.get('client_name', '').strip()
+    project = request.form.get('project', '').strip()
 
     job_id = str(uuid.uuid4())[:8]
     job = Job(job_id, f.filename, batch_size)
@@ -793,7 +861,7 @@ def split_and_upload():
 
     threading.Thread(
         target=job_split_and_upload,
-        args=(job, pp, od, vertesia_jwt, collection_id),
+        args=(job, pp, od, vertesia_jwt, collection_id, client_name, project),
         daemon=True,
     ).start()
 

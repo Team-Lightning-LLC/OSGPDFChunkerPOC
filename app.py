@@ -191,6 +191,31 @@ def detect_boundaries_text(pdf_path, job=None):
         job.phase = "text_scan"
         job.status = "processing"
 
+    # --- Quality gate: is the text layer substantial enough to trust? ---
+    MIN_TEXT_CHARS = 200
+    page_text_lengths = []
+    for p in range(total):
+        text_len = len(doc[p].get_text().strip())
+        page_text_lengths.append(text_len)
+
+    pages_with_substance = sum(1 for l in page_text_lengths if l >= MIN_TEXT_CHARS)
+    substance_ratio = pages_with_substance / total if total else 0
+    print(f"[DETECT-TEXT] Text quality: {pages_with_substance}/{total} pages have >= {MIN_TEXT_CHARS} chars ({substance_ratio:.0%})")
+
+    if substance_ratio < 0.5:
+        print(f"[DETECT-TEXT] Text layer too thin ({substance_ratio:.0%} substantial pages). Falling back to OCR")
+        doc.close()
+        if job:
+            job.diagnostics = {
+                'stage': 'text_quality_gate',
+                'reason': 'text_layer_too_thin',
+                'total_pages': total,
+                'pages_with_substantial_text': pages_with_substance,
+                'substance_ratio': round(substance_ratio, 3),
+                'threshold': '50% of pages must have >= 200 chars',
+            }
+        return None
+
     # --- Pass 1: extract all addresses from every page ---
     page_addr_details = {}  # page -> list of address dicts
     csz_pages = {}          # csz_key -> list of pages it appears on
@@ -284,6 +309,21 @@ def detect_boundaries_text(pdf_path, job=None):
                 'all_addresses': {k: len(v) for k, v in csz_pages.items()},
                 'corporate_addresses': list(corp),
                 'surviving_addresses': [k for k in csz_pages if k not in corp],
+            }
+        return None
+
+    # --- Sanity check: does the result make sense? ---
+    avg_pages_per_customer = total / len(boundaries)
+    if len(boundaries) == 1 and total > 10:
+        print(f"[DETECT-TEXT] Only 1 boundary in {total}-page doc — likely bad detection. Falling back to OCR")
+        doc.close()
+        if job:
+            job.diagnostics = {
+                'stage': 'text_sanity_check',
+                'reason': 'single_boundary_in_large_doc',
+                'total_pages': total,
+                'boundaries_found': 1,
+                'avg_pages_per_customer': round(avg_pages_per_customer, 1),
             }
         return None
 

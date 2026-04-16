@@ -73,10 +73,13 @@ def upload_to_supabase(file_path, filename, collection_id=None):
 
 
 def find_after_samples_collection(client_name):
-    """Find the After Samples collection for a client by group_name."""
-    result = sb.table('collections').select('id').eq('group_name', client_name).ilike('type_name', '%after sample%').execute()
-    if result.data and len(result.data) > 0:
-        return result.data[0]['id']
+    """Find the After Samples collection for a client by group_name.
+    Handles: 'Aftersamples', 'After Samples', 'Raw Aftersamples', etc."""
+    for pattern in ['%aftersample%', '%after sample%', '%after%sample%']:
+        result = sb.table('collections').select('id').eq('group_name', client_name).ilike('type_name', pattern).execute()
+        if result.data and len(result.data) > 0:
+            print(f"[UPLOAD] Found collection via pattern '{pattern}': {result.data[0]['id']}")
+            return result.data[0]['id']
     return None
 
 
